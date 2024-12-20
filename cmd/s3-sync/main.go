@@ -15,9 +15,11 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -25,6 +27,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
+
+var LogLevel = new(slog.LevelVar)
+
+func debugTimeElapsed(message string) func() {
+	start := time.Now()
+	return func() {
+		slog.Debug(message, "ms", float64(time.Since(start).Microseconds())/1000)
+	}
+}
 
 type digestAlgorithmFlag []string
 
@@ -170,6 +181,10 @@ func getHasher(algorithm DigestAlgorithm) (hash.Hash, error) {
 }
 
 func getHash(algorithm DigestAlgorithm, reader io.Reader) (string, error) {
+	if LogLevel.Level() == slog.LevelDebug {
+		defer debugTimeElapsed("hash " + algorithm.String())()
+	}
+
 	hasher, err := getHasher(algorithm)
 	if err != nil {
 		return "", err
@@ -485,11 +500,15 @@ func (s *Syncer) syncToS3(
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile | log.Lmicroseconds)
 
+	logHandler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: LogLevel})
+	slog.SetDefault(slog.New(logHandler))
+
 	var digestAlgorithmFlags digestAlgorithmFlag
 
 	profile := flag.String("profile", "default", "the AWS profile to use")
 	sizeOnly := flag.Bool("sizeOnly", false, "only check file size")
 	dryRun := flag.Bool("dryRun", false, "dry run")
+	debug := flag.Bool("debug", false, "debug logging")
 	flag.Var(&digestAlgorithmFlags, "digestAlgorithm", "the digest algorithm, either sha1 or sha256")
 	helpFlag := flag.Bool("help", false, "print this help message")
 	flag.Parse()
@@ -515,6 +534,10 @@ func main() {
 		algorithms = append(algorithms, algorithm)
 	}
 
+	if *debug {
+		LogLevel.Set(slog.LevelDebug)
+	}
+
 	src, dst := args[0], args[1]
 
 	srcPath, err := parseLocal(src)
@@ -530,11 +553,15 @@ func main() {
 
 	ctx := context.Background()
 
-	log.Printf("src: %v", srcPath)
-	log.Printf("dst: %v", dstPath)
-	log.Printf("algorithms: %v", algorithms)
-	log.Printf("size only: %v", *sizeOnly)
-	log.Printf("dry run: %v", *dryRun)
+	slog.DebugContext(
+		ctx,
+		"arguments",
+		"src", srcPath,
+		"dst", dstPath,
+		"algorithms", algorithms,
+		"size only", *sizeOnly,
+		"dry run", *dryRun,
+	)
 
 	syncer, err := NewSyncer(ctx, *profile, algorithms, *sizeOnly, *dryRun)
 
