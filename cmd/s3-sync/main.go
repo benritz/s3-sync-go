@@ -224,19 +224,138 @@ type SyncTypeResult struct {
 	Metadata          map[string]string
 }
 
-func checkIfSyncNeeded(
+func generateDigests(
+	algorithms []DigestAlgorithm,
+	reader io.ReadSeeker,
+	metadata map[string]string,
+) error {
+	for _, algorithm := range algorithms {
+		hash, err := getHash(algorithm, reader)
+		if err != nil {
+			return fmt.Errorf("failed to compute hash: %v", err)
+		}
+		metadata[algorithm.String()] = hash
+
+		// reuse reader
+		reader.Seek(0, io.SeekStart)
+	}
+
+	return nil
+}
+
+type Syncer struct {
+	Algorithms []DigestAlgorithm
+	SizeOnly   bool
+	DryRun     bool
+
+	s3Client *s3.Client
+	uploader *manager.Uploader
+}
+
+func NewSyncer(
+	ctx context.Context,
+	profile string,
+	algorithms []DigestAlgorithm,
+	sizeOnly bool,
+	dryRun bool,
+) (*Syncer, error) {
+	config, err := getAwsConfig(ctx, profile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get aws config: %v", err)
+	}
+
+	s3Client := s3.NewFromConfig(config)
+
+	return &Syncer{
+		Algorithms: algorithms,
+		SizeOnly:   sizeOnly,
+		DryRun:     dryRun,
+		s3Client:   s3Client,
+		uploader:   manager.NewUploader(s3Client),
+	}, nil
+}
+
+func (s *Syncer) Sync(ctx context.Context, srcPath localPath, dstPath s3Path) error {
+	var syncCheck SyncCheck
+
+	if s.SizeOnly {
+		syncCheck = SizeOnly
+	} else {
+		syncCheck = ModifiedAndSize
+	}
+
+	if srcPath.stat.IsDir() {
+		// check for any objects under destination
+		// we don't need to perform any sync checks if the destination is empty
+		maxKeys := int32(1)
+		ret, err := s.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:  aws.String(dstPath.bucket),
+			Prefix:  aws.String(dstPath.prefix + "/"),
+			MaxKeys: &maxKeys,
+		})
+		if err != nil {
+			log.Fatalf("failed to list destination objects: %v", err)
+		}
+
+		if *ret.KeyCount == 0 {
+			syncCheck = None
+		}
+	}
+
+	err := filepath.WalkDir(srcPath.path, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// ignore?
+			return nil
+		}
+
+		if d.IsDir() {
+			// ignore?
+			// create directory marker in S3?
+			return nil
+		}
+
+		rel := strings.TrimPrefix(path, srcPath.base)
+		key := dstPath.prefix + "/" + rel
+
+		ret, err := s.syncToS3(
+			ctx,
+			dstPath.bucket,
+			key,
+			path,
+			d,
+			syncCheck,
+		)
+
+		if err != nil {
+			return err
+		}
+
+		switch ret.Type {
+		case Skip:
+			log.Printf("%s: skipped", path)
+		case MetadataOnly:
+			log.Printf("%s: updated metadata %v", path, ret.MissingAlgorithms)
+		case Upload:
+			log.Printf("%s: uploaded", path)
+		}
+
+		return nil
+	})
+
+	return err
+}
+
+func (s *Syncer) checkIfSyncNeeded(
 	ctx context.Context,
 	bucket, key, path string,
 	entry fs.DirEntry,
 	syncCheck SyncCheck,
-	algorithms []DigestAlgorithm,
-	s3Client *s3.Client,
 ) (*SyncTypeResult, error) {
 	if syncCheck == None {
 		return &SyncTypeResult{Type: Upload}, nil
 	}
 
-	objectInfo, err := s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+	objectInfo, err := s.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 	})
@@ -269,7 +388,7 @@ func checkIfSyncNeeded(
 
 	if match {
 		missingAlgorithms := make([]DigestAlgorithm, 0)
-		for _, algorithm := range algorithms {
+		for _, algorithm := range s.Algorithms {
 			if _, exists := objectInfo.Metadata[algorithm.String()]; !exists {
 				missingAlgorithms = append(missingAlgorithms, algorithm)
 			}
@@ -289,43 +408,20 @@ func checkIfSyncNeeded(
 	return &SyncTypeResult{Type: Upload}, nil
 }
 
-func generateDigests(
-	algorithms []DigestAlgorithm,
-	reader io.ReadSeeker,
-	metadata map[string]string,
-) error {
-	for _, algorithm := range algorithms {
-		hash, err := getHash(algorithm, reader)
-		if err != nil {
-			return fmt.Errorf("failed to compute hash: %v", err)
-		}
-		metadata[algorithm.String()] = hash
-
-		// reuse reader
-		reader.Seek(0, io.SeekStart)
-	}
-
-	return nil
-}
-
-func syncToS3(
+func (s *Syncer) syncToS3(
 	ctx context.Context,
 	bucket, key, path string,
 	entry fs.DirEntry,
 	checkMode SyncCheck,
-	algorithms []DigestAlgorithm,
-	s3Client *s3.Client,
-	uploader *manager.Uploader,
 ) (*SyncTypeResult, error) {
-	ret, err := checkIfSyncNeeded(
+	ret, err := s.checkIfSyncNeeded(
 		ctx,
 		bucket,
 		key,
 		path,
 		entry,
-		checkMode,
-		algorithms,
-		s3Client)
+		checkMode)
+
 	if err != nil {
 		return nil, err
 	}
@@ -346,36 +442,40 @@ func syncToS3(
 			metadata = make(map[string]string)
 		}
 
-		generateDigests(algorithms, reader, metadata)
+		generateDigests(s.Algorithms, reader, metadata)
 
-		_, err = s3Client.CopyObject(ctx, &s3.CopyObjectInput{
-			Bucket:            aws.String(bucket),
-			Key:               aws.String(key),
-			CopySource:        aws.String(bucket + "/" + key),
-			Metadata:          metadata,
-			MetadataDirective: s3types.MetadataDirectiveReplace,
-		})
+		if !s.DryRun {
+			_, err = s.s3Client.CopyObject(ctx, &s3.CopyObjectInput{
+				Bucket:            aws.String(bucket),
+				Key:               aws.String(key),
+				CopySource:        aws.String(bucket + "/" + key),
+				Metadata:          metadata,
+				MetadataDirective: s3types.MetadataDirectiveReplace,
+			})
 
-		if err != nil {
-			return nil, fmt.Errorf("failed to update metadata: %v", err)
+			if err != nil {
+				return nil, fmt.Errorf("failed to update metadata: %v", err)
+			}
 		}
 	} else {
 		metadata := make(map[string]string)
 
-		generateDigests(algorithms, reader, metadata)
+		generateDigests(s.Algorithms, reader, metadata)
 
-		_, err = uploader.Upload(
-			ctx,
-			&s3.PutObjectInput{
-				Bucket:   aws.String(bucket),
-				Key:      aws.String(key),
-				Body:     reader,
-				Metadata: metadata,
-			},
-		)
+		if !s.DryRun {
+			_, err = s.uploader.Upload(
+				ctx,
+				&s3.PutObjectInput{
+					Bucket:   aws.String(bucket),
+					Key:      aws.String(key),
+					Body:     reader,
+					Metadata: metadata,
+				},
+			)
 
-		if err != nil {
-			return nil, fmt.Errorf("failed to upload: %v", err)
+			if err != nil {
+				return nil, fmt.Errorf("failed to upload: %v", err)
+			}
 		}
 	}
 
@@ -430,88 +530,19 @@ func main() {
 
 	ctx := context.Background()
 
-	config, err := getAwsConfig(ctx, *profile)
-	if err != nil {
-		log.Fatalf("failed to get aws config: %v", err)
-	}
-
-	s3Client := s3.NewFromConfig(config)
-	uploader := manager.NewUploader(s3Client)
-
-	var syncCheck SyncCheck
-
-	if *sizeOnly {
-		syncCheck = SizeOnly
-	} else {
-		syncCheck = ModifiedAndSize
-	}
-
-	if srcPath.stat.IsDir() {
-		// check for any objects under destination
-		// we don't need to perform any sync checks if the destination is empty
-		maxKeys := int32(1)
-		ret, err := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:  aws.String(dstPath.bucket),
-			Prefix:  aws.String(dstPath.prefix + "/"),
-			MaxKeys: &maxKeys,
-		})
-		if err != nil {
-			log.Fatalf("failed to list destination objects: %v", err)
-		}
-
-		if *ret.KeyCount == 0 {
-			syncCheck = None
-		}
-	}
-
 	log.Printf("src: %v", srcPath)
 	log.Printf("dst: %v", dstPath)
 	log.Printf("algorithms: %v", algorithms)
-	log.Printf("sync check: %v", syncCheck)
+	log.Printf("size only: %v", *sizeOnly)
 	log.Printf("dry run: %v", *dryRun)
 
-	err = filepath.WalkDir(srcPath.path, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			// ignore?
-			return nil
-		}
+	syncer, err := NewSyncer(ctx, *profile, algorithms, *sizeOnly, *dryRun)
 
-		if d.IsDir() {
-			// ignore?
-			// create directory marker in S3?
-			return nil
-		}
+	if err != nil {
+		log.Fatalf("failed to create syncer: %v", err)
+	}
 
-		rel := strings.TrimPrefix(path, srcPath.base)
-		key := dstPath.prefix + "/" + rel
-
-		ret, err := syncToS3(
-			ctx,
-			dstPath.bucket,
-			key,
-			path,
-			d,
-			syncCheck,
-			algorithms,
-			s3Client,
-			uploader,
-		)
-
-		if err != nil {
-			return err
-		}
-
-		switch ret.Type {
-		case Skip:
-			log.Printf("%s: skipped", path)
-		case MetadataOnly:
-			log.Printf("%s: updated metadata %v", path, ret.MissingAlgorithms)
-		case Upload:
-			log.Printf("%s: uploaded", path)
-		}
-
-		return nil
-	})
+	syncer.Sync(ctx, *srcPath, *dstPath)
 
 	if err != nil {
 		log.Fatalf("sync failed: %v", err)
