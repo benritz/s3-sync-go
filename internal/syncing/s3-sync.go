@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 type hashAlgorithmFlag []string
@@ -30,8 +31,9 @@ func S3Sync() {
 	profile := flag.String("profile", "default", "the AWS profile to use")
 	sizeOnly := flag.Bool("sizeOnly", false, "only check file size")
 	dryRun := flag.Bool("dryRun", false, "dry run")
-	debug := flag.Bool("debug", false, "debug logging")
 	flag.Var(&hashAlgorithmFlags, "hashAlgorithm", "the hash algorithm, either sha1, sha256, sha512, crc32, crc32c or md5, defaults to sha1")
+	concurrency := flag.Int("concurrency", 5, "the number of concurrent sync operations")
+	debug := flag.Bool("debug", false, "debug logging")
 	helpFlag := flag.Bool("help", false, "print this help message")
 	flag.Parse()
 
@@ -54,6 +56,11 @@ func S3Sync() {
 			log.Fatalf("%v", err)
 		}
 		algorithms = append(algorithms, algorithm)
+	}
+
+	maxConcurrency := runtime.GOMAXPROCS(0)
+	if *concurrency < 1 || *concurrency > maxConcurrency {
+		log.Fatalf("invalid concurrency: must be between 1 and %d, got %d", maxConcurrency, concurrency)
 	}
 
 	if *debug {
@@ -85,7 +92,14 @@ func S3Sync() {
 		"dry run", *dryRun,
 	)
 
-	syncer, err := NewSyncer(ctx, *profile, algorithms, *sizeOnly, *dryRun)
+	syncer, err := NewSyncer(
+		ctx,
+		*profile,
+		algorithms,
+		*concurrency,
+		*sizeOnly,
+		*dryRun,
+	)
 
 	if err != nil {
 		fmt.Printf("failed to create syncer: %v", err)

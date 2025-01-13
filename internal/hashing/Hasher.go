@@ -151,14 +151,16 @@ func (h *Hasher) worker(ctx context.Context) {
 	}
 }
 
-func NewHasher(ctx context.Context) *Hasher {
+func NewHasher(ctx context.Context, concurrency int) *Hasher {
 	hasher := &Hasher{
 		queue: make(chan hashJob),
 	}
 
-	workerPoolSize := runtime.GOMAXPROCS(0)
+	// ensure that the number of workers is between 1 and GOMAXPROCS
+	maxConcurrency := runtime.GOMAXPROCS(0)
+	concurrency = max(1, min(concurrency, maxConcurrency))
 
-	for i := 0; i < workerPoolSize; i++ {
+	for i := 0; i < concurrency; i++ {
 		go hasher.worker(ctx)
 	}
 

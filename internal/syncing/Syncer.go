@@ -206,6 +206,7 @@ func NewSyncer(
 	ctx context.Context,
 	profile string,
 	algorithms []hashing.Algorithm,
+	concurrency int,
 	sizeOnly bool,
 	dryRun bool,
 ) (*Syncer, error) {
@@ -222,14 +223,11 @@ func NewSyncer(
 		DryRun:     dryRun,
 		s3Client:   s3Client,
 		uploader:   manager.NewUploader(s3Client),
-		hasher:     hashing.NewHasher(ctx),
+		hasher:     hashing.NewHasher(ctx, concurrency*len(algorithms)),
 		queue:      make(chan syncJob),
 	}
 
-	//// TODO needs to be configurable
-	workerPoolSize := 2
-
-	for i := 0; i < workerPoolSize; i++ {
+	for i := 0; i < concurrency; i++ {
 		go s.worker(ctx, i)
 	}
 
