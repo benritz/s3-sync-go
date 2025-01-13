@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -55,12 +56,50 @@ const (
 	Skip SyncType = iota
 	Upload
 	MetadataOnly
+	Error
 )
 
-type SyncTypeResult struct {
+type SyncResult struct {
+	Bucket            string
+	Key               string
+	Path              string
 	Type              SyncType
 	MissingAlgorithms []hashing.Algorithm
 	Metadata          map[string]string
+	Err               error
+}
+
+func NewSyncResult(bucket, key, path string) *SyncResult {
+	return &SyncResult{
+		Bucket: bucket,
+		Key:    key,
+		Path:   path,
+	}
+}
+
+func (r *SyncResult) Upload() *SyncResult {
+	r.Type = Upload
+	return r
+}
+
+func (r *SyncResult) Skip() *SyncResult {
+	r.Type = Skip
+	return r
+}
+
+func (r *SyncResult) MetadataOnly(missingAlgorithms []hashing.Algorithm, metadata map[string]string) *SyncResult {
+	r.Type = MetadataOnly
+	r.MissingAlgorithms = missingAlgorithms
+	r.Metadata = metadata
+	return r
+}
+
+func (r *SyncResult) Error(err error) *SyncResult {
+	if r.Type == 0 {
+		r.Type = Error
+	}
+	r.Err = err
+	return r
 }
 
 func (s *Syncer) generateHashes(
@@ -100,14 +139,67 @@ func (s *Syncer) generateHashes(
 	}
 }
 
+type syncJob struct {
+	Bucket    string
+	Key       string
+	Path      string
+	DirEntry  fs.DirEntry `json:"-"`
+	SyncCheck SyncCheck
+	Result    chan<- *SyncResult `json:"-"`
+}
+
 type Syncer struct {
 	Algorithms []hashing.Algorithm
 	SizeOnly   bool
 	DryRun     bool
 
-	s3Client *s3.Client
-	uploader *manager.Uploader
-	hasher   *hashing.Hasher
+	s3Client  *s3.Client
+	uploader  *manager.Uploader
+	hasher    *hashing.Hasher
+	queue     chan syncJob
+	waitGroup sync.WaitGroup
+}
+
+func (s *Syncer) worker(ctx context.Context, id int) {
+	s.waitGroup.Add(1)
+	defer s.waitGroup.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-s.queue:
+			if !ok {
+				return
+			}
+
+			slog.Info("worker", "id", id, "job", job)
+
+			ret := s.syncToS3(
+				ctx,
+				job.Bucket,
+				job.Key,
+				job.Path,
+				job.DirEntry,
+				job.SyncCheck,
+			)
+
+			if logging.LogLevel.Level() == slog.LevelDebug {
+				switch ret.Type {
+				case Error:
+					slog.Debug("failed to sync", "path", ret.Path, "err", ret.Err)
+				case Skip:
+					slog.Debug("skipped", "path", ret.Path)
+				case MetadataOnly:
+					slog.Debug("updated metadata", "path", ret.Path, "missingAlgorithms", ret.MissingAlgorithms)
+				case Upload:
+					slog.Debug("uploaded", "path", ret.Path)
+				}
+			}
+
+			job.Result <- ret
+		}
+	}
 }
 
 func NewSyncer(
@@ -124,17 +216,37 @@ func NewSyncer(
 
 	s3Client := s3.NewFromConfig(config)
 
-	return &Syncer{
+	s := &Syncer{
 		Algorithms: algorithms,
 		SizeOnly:   sizeOnly,
 		DryRun:     dryRun,
 		s3Client:   s3Client,
 		uploader:   manager.NewUploader(s3Client),
 		hasher:     hashing.NewHasher(ctx),
-	}, nil
+		queue:      make(chan syncJob),
+	}
+
+	//// TODO needs to be configurable
+	workerPoolSize := 2
+
+	for i := 0; i < workerPoolSize; i++ {
+		go s.worker(ctx, i)
+	}
+
+	return s, nil
 }
 
-func (s *Syncer) Sync(ctx context.Context, srcPath paths.LocalPath, dstPath paths.S3Path) error {
+func (s *Syncer) Close() {
+	close(s.queue)
+	s.waitGroup.Wait()
+}
+
+func (s *Syncer) Sync(
+	ctx context.Context,
+	srcPath paths.LocalPath,
+	dstPath paths.S3Path,
+	result chan<- *SyncResult,
+) error {
 	var syncCheck SyncCheck
 
 	if s.SizeOnly {
@@ -175,26 +287,13 @@ func (s *Syncer) Sync(ctx context.Context, srcPath paths.LocalPath, dstPath path
 		rel := strings.TrimPrefix(path, srcPath.Base)
 		key := dstPath.Prefix + "/" + rel
 
-		ret, err := s.syncToS3(
-			ctx,
-			dstPath.Bucket,
-			key,
-			path,
-			d,
-			syncCheck,
-		)
-
-		if err != nil {
-			return err
-		}
-
-		switch ret.Type {
-		case Skip:
-			log.Printf("%s: skipped", path)
-		case MetadataOnly:
-			log.Printf("%s: updated metadata %v", path, ret.MissingAlgorithms)
-		case Upload:
-			log.Printf("%s: uploaded", path)
+		s.queue <- syncJob{
+			Bucket:    dstPath.Bucket,
+			Key:       key,
+			Path:      path,
+			DirEntry:  d,
+			SyncCheck: syncCheck,
+			Result:    result,
 		}
 
 		return nil
@@ -208,9 +307,11 @@ func (s *Syncer) checkIfSyncNeeded(
 	bucket, key, path string,
 	entry fs.DirEntry,
 	syncCheck SyncCheck,
-) (*SyncTypeResult, error) {
+) *SyncResult {
+	ret := NewSyncResult(bucket, key, path)
+
 	if syncCheck == None {
-		return &SyncTypeResult{Type: Upload}, nil
+		return ret.Upload()
 	}
 
 	objectInfo, err := s.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
@@ -221,14 +322,14 @@ func (s *Syncer) checkIfSyncNeeded(
 	if err != nil {
 		var notFound *types.NotFound
 		if errors.As(err, &notFound) {
-			return &SyncTypeResult{Type: Upload}, nil
+			return ret.Upload()
 		}
-		return nil, fmt.Errorf("failed to head object: %s %v", key, err)
+		return ret.Error(fmt.Errorf("failed to head object: %s %v", key, err))
 	}
 
 	fileInfo, err := entry.Info()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get file info: %s %v", path, err)
+		return ret.Error(fmt.Errorf("failed to get file info: %s %v", path, err))
 	}
 
 	objectSize := objectInfo.ContentLength
@@ -253,17 +354,13 @@ func (s *Syncer) checkIfSyncNeeded(
 		}
 
 		if len(missingAlgorithms) == 0 {
-			return &SyncTypeResult{Type: Skip}, nil
+			return ret.Skip()
 		}
 
-		return &SyncTypeResult{
-			Type:              MetadataOnly,
-			MissingAlgorithms: missingAlgorithms,
-			Metadata:          objectInfo.Metadata,
-		}, nil
+		return ret.MetadataOnly(missingAlgorithms, objectInfo.Metadata)
 	}
 
-	return &SyncTypeResult{Type: Upload}, nil
+	return ret.Upload()
 }
 
 func (s *Syncer) copyObject(ctx context.Context, path, bucket, key string, metadata map[string]string) error {
@@ -319,8 +416,8 @@ func (s *Syncer) syncToS3(
 	bucket, key, path string,
 	entry fs.DirEntry,
 	checkMode SyncCheck,
-) (*SyncTypeResult, error) {
-	ret, err := s.checkIfSyncNeeded(
+) *SyncResult {
+	ret := s.checkIfSyncNeeded(
 		ctx,
 		bucket,
 		key,
@@ -328,12 +425,8 @@ func (s *Syncer) syncToS3(
 		entry,
 		checkMode)
 
-	if err != nil {
-		return nil, err
-	}
-
-	if ret.Type == Skip {
-		return ret, nil
+	if ret.Type == Error || ret.Type == Skip {
+		return ret
 	}
 
 	if ret.Type == MetadataOnly {
@@ -342,7 +435,7 @@ func (s *Syncer) syncToS3(
 		if !s.DryRun {
 			err := s.copyObject(ctx, path, bucket, key, metadata)
 			if err != nil {
-				return nil, err
+				return ret.Error(err)
 			}
 		}
 	} else {
@@ -351,10 +444,10 @@ func (s *Syncer) syncToS3(
 		if !s.DryRun {
 			err := s.uploadObject(ctx, path, bucket, key, metadata)
 			if err != nil {
-				return nil, err
+				return ret.Error(err)
 			}
 		}
 	}
 
-	return ret, nil
+	return ret
 }

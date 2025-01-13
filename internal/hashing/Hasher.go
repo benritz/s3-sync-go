@@ -126,8 +126,7 @@ type hashJob struct {
 }
 
 type Hasher struct {
-	queue          chan hashJob
-	workerPoolSize int
+	queue chan hashJob
 }
 
 func (h *Hasher) worker(ctx context.Context) {
@@ -154,11 +153,12 @@ func (h *Hasher) worker(ctx context.Context) {
 
 func NewHasher(ctx context.Context) *Hasher {
 	hasher := &Hasher{
-		workerPoolSize: runtime.GOMAXPROCS(0),
-		queue:          make(chan hashJob),
+		queue: make(chan hashJob),
 	}
 
-	for i := 0; i < hasher.workerPoolSize; i++ {
+	workerPoolSize := runtime.GOMAXPROCS(0)
+
+	for i := 0; i < workerPoolSize; i++ {
 		go hasher.worker(ctx)
 	}
 

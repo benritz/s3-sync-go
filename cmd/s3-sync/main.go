@@ -27,7 +27,7 @@ func (flag *digestAlgorithmFlag) Set(value string) error {
 }
 
 func main() {
-	logging.Init()
+	logging.Configure()
 
 	var digestAlgorithmFlags digestAlgorithmFlag
 
@@ -96,13 +96,45 @@ func main() {
 		log.Fatalf("failed to create syncer: %v", err)
 	}
 
-	syncer.Sync(ctx, *srcPath, *dstPath)
+	result := make(chan *sync.SyncResult)
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ret, ok := <-result:
+				if !ok {
+					return
+				}
+
+				rel := ret.Path[len(srcPath.Base):]
+
+				switch ret.Type {
+				case sync.Error:
+					fmt.Printf("%s: failed to sync %v\n", rel, ret.Err)
+				case sync.Skip:
+					fmt.Printf("%s: skipped\n", rel)
+				case sync.MetadataOnly:
+					fmt.Printf("%s: updated metadata %v\n", rel, ret.MissingAlgorithms)
+				case sync.Upload:
+					fmt.Printf("%s: uploaded\n", rel)
+				}
+			}
+		}
+	}()
+
+	err = syncer.Sync(ctx, *srcPath, *dstPath, result)
+
+	syncer.Close()
+	close(result)
 
 	if err != nil {
 		fmt.Printf("sync failed: %v", err)
-		log.Fatalf("sync failed: %v", err)
+		slog.Error("sync failed", "err", err)
+		os.Exit(1)
 	}
 
 	fmt.Println("sync complete")
-	log.Println("sync complete")
+	slog.Info("sync complete")
 }

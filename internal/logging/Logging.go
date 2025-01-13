@@ -16,7 +16,7 @@ func DebugTimeElapsed(message string) func() {
 	}
 }
 
-func Init() {
+func Configure() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile | log.Lmicroseconds)
 
 	logHandler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: LogLevel})
