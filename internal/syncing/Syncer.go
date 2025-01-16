@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -54,7 +53,7 @@ type SyncType int
 
 const (
 	Skip SyncType = iota
-	Upload
+	Copied
 	MetadataOnly
 	Error
 )
@@ -77,8 +76,8 @@ func NewSyncResult(bucket, key, path string) *SyncResult {
 	}
 }
 
-func (r *SyncResult) Upload() *SyncResult {
-	r.Type = Upload
+func (r *SyncResult) Copied() *SyncResult {
+	r.Type = Copied
 	return r
 }
 
@@ -173,7 +172,12 @@ func (s *Syncer) worker(ctx context.Context, id int) {
 				return
 			}
 
-			slog.Info("worker", "id", id, "job", job)
+			slog.DebugContext(
+				ctx,
+				"sync worker: got job",
+				"workerId", id,
+				"job", job,
+			)
 
 			ret := s.syncToS3(
 				ctx,
@@ -185,15 +189,40 @@ func (s *Syncer) worker(ctx context.Context, id int) {
 			)
 
 			if logging.LogLevel.Level() == slog.LevelDebug {
+				src := ret.Path
+				dst := fmt.Sprintf("s3://%s/%s", ret.Bucket, ret.Key)
+
 				switch ret.Type {
 				case Error:
-					slog.Debug("failed to sync", "path", ret.Path, "err", ret.Err)
+					slog.DebugContext(
+						ctx,
+						"sync worker: failed to sync",
+						"src", src,
+						"dst", dst,
+						"err", ret.Err,
+					)
 				case Skip:
-					slog.Debug("skipped", "path", ret.Path)
+					slog.DebugContext(
+						ctx,
+						"sync worker: skipped",
+						"src", src,
+						"dst", dst,
+					)
 				case MetadataOnly:
-					slog.Debug("updated metadata", "path", ret.Path, "missingAlgorithms", ret.MissingAlgorithms)
-				case Upload:
-					slog.Debug("uploaded", "path", ret.Path)
+					slog.DebugContext(
+						ctx,
+						"sync worker: updated metadata",
+						"src", src,
+						"dst", dst,
+						"missingAlgorithms", ret.MissingAlgorithms,
+					)
+				case Copied:
+					slog.DebugContext(
+						ctx,
+						"sync worker: copied",
+						"src", src,
+						"dst", dst,
+					)
 				}
 			}
 
@@ -257,13 +286,15 @@ func (s *Syncer) Sync(
 		// check for any objects under destination
 		// we don't need to perform any sync checks if the destination is empty
 		maxKeys := int32(1)
+
 		ret, err := s.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:  aws.String(dstPath.Bucket),
 			Prefix:  aws.String(dstPath.Prefix + "/"),
 			MaxKeys: &maxKeys,
 		})
+
 		if err != nil {
-			log.Fatalf("failed to list destination objects: %v", err)
+			return fmt.Errorf("failed to check for destination objects: %v", err)
 		}
 
 		if *ret.KeyCount == 0 {
@@ -272,11 +303,6 @@ func (s *Syncer) Sync(
 	}
 
 	err := filepath.WalkDir(srcPath.Path, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			log.Printf("%s: error reading path %v", path, err)
-			return nil
-		}
-
 		if d.IsDir() {
 			// ignore - don't create directory marker in S3
 			return nil
@@ -284,6 +310,12 @@ func (s *Syncer) Sync(
 
 		rel := strings.TrimPrefix(path, srcPath.Base)
 		key := dstPath.Prefix + "/" + rel
+
+		if err != nil {
+			ret := NewSyncResult(dstPath.Bucket, key, path)
+			result <- ret.Error(fmt.Errorf("failed to read path: %v", err))
+			return nil
+		}
 
 		s.queue <- syncJob{
 			Bucket:    dstPath.Bucket,
@@ -309,7 +341,7 @@ func (s *Syncer) checkIfSyncNeeded(
 	ret := NewSyncResult(bucket, key, path)
 
 	if syncCheck == None {
-		return ret.Upload()
+		return ret.Copied()
 	}
 
 	objectInfo, err := s.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
@@ -320,7 +352,7 @@ func (s *Syncer) checkIfSyncNeeded(
 	if err != nil {
 		var notFound *types.NotFound
 		if errors.As(err, &notFound) {
-			return ret.Upload()
+			return ret.Copied()
 		}
 		return ret.Error(fmt.Errorf("failed to head object: %s %v", key, err))
 	}
@@ -358,7 +390,7 @@ func (s *Syncer) checkIfSyncNeeded(
 		return ret.MetadataOnly(missingAlgorithms, objectInfo.Metadata)
 	}
 
-	return ret.Upload()
+	return ret.Copied()
 }
 
 func (s *Syncer) copyObject(ctx context.Context, path, bucket, key string, metadata map[string]string) error {

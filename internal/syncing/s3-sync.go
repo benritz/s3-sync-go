@@ -7,11 +7,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 )
 
 type hashAlgorithmFlag []string
@@ -26,14 +26,17 @@ func (flag *hashAlgorithmFlag) Set(value string) error {
 }
 
 func S3Sync() {
+	ctx := context.Background()
+
 	var hashAlgorithmFlags hashAlgorithmFlag
 
 	profile := flag.String("profile", "default", "the AWS profile to use")
 	sizeOnly := flag.Bool("sizeOnly", false, "only check file size")
 	dryRun := flag.Bool("dryRun", false, "dry run")
-	flag.Var(&hashAlgorithmFlags, "hashAlgorithm", "the hash algorithm, either sha1, sha256, sha512, crc32, crc32c or md5, defaults to sha1")
+	flag.Var(&hashAlgorithmFlags, "hashAlgorithm", "the hash algorithm: sha1 (default), sha256, sha512, crc32, crc32c, md5")
 	concurrency := flag.Int("concurrency", 5, "the number of concurrent sync operations")
-	debug := flag.Bool("debug", false, "debug logging")
+	logLevel := flag.String("logLevel", "none", "log level: none, error, warn, info, debug")
+	logFile := flag.String("logFile", "", "log file")
 	helpFlag := flag.Bool("help", false, "print this help message")
 	flag.Parse()
 
@@ -44,7 +47,7 @@ func S3Sync() {
 	args := flag.Args()
 
 	if len(args) != 2 || *helpFlag {
-		log.Printf("Usage: %s <flags> <source> <destination>", filepath.Base(os.Args[0]))
+		fmt.Printf("Usage: %s <flags> <source> <destination>\n", filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
@@ -53,34 +56,50 @@ func S3Sync() {
 	for _, algorithmName := range hashAlgorithmFlags {
 		algorithm, err := hashing.ParseAlgorithm(algorithmName)
 		if err != nil {
-			log.Fatalf("%v", err)
+			logging.FatalError(ctx, "failed to parse algorithm", err)
 		}
 		algorithms = append(algorithms, algorithm)
 	}
 
 	maxConcurrency := runtime.GOMAXPROCS(0)
 	if *concurrency < 1 || *concurrency > maxConcurrency {
-		log.Fatalf("invalid concurrency: must be between 1 and %d, got %d", maxConcurrency, concurrency)
+		logging.FatalError(ctx, "invalid concurrency", fmt.Errorf("concurrency must be between 1 and %d, got %d", maxConcurrency, *concurrency))
 	}
 
-	if *debug {
-		logging.LogLevel.Set(slog.LevelDebug)
+	if *logLevel == "none" {
+		logging.DestNone()
+	} else {
+		level, err := logging.ParseLevel(*logLevel)
+		if err != nil {
+			logging.FatalError(ctx, "invalid log level", err)
+		}
+		logging.LogLevel.Set(level)
+
+		logging.DestStdErr()
 	}
+
+	if logFile != nil && *logFile != "" {
+		err := logging.DestFile(*logFile)
+		if err != nil {
+			logging.FatalError(ctx, "failed to open log file", err)
+		}
+	}
+
+	logging.Configure()
+	defer logging.Dispose()
 
 	src, dst := args[0], args[1]
 
 	srcPath, err := paths.ParseLocal(src)
 	if err != nil {
-		log.Fatalf("failed to parse source: %v", err)
+		logging.FatalError(ctx, "failed to parse source", err)
 	}
 
 	dstPath, err := paths.ParseS3Path(dst)
 
 	if err != nil {
-		log.Fatalf("failed to parse destination: %v", err)
+		logging.FatalError(ctx, "failed to parse destination", err)
 	}
-
-	ctx := context.Background()
 
 	slog.DebugContext(
 		ctx,
@@ -102,13 +121,16 @@ func S3Sync() {
 	)
 
 	if err != nil {
-		fmt.Printf("failed to create syncer: %v", err)
-		log.Fatalf("failed to create syncer: %v", err)
+		logging.FatalError(ctx, "failed to create syncer", err)
 	}
 
 	result := make(chan *SyncResult)
 
+	var wg sync.WaitGroup
+	wg.Add(1)
+
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-ctx.Done():
@@ -127,7 +149,7 @@ func S3Sync() {
 					fmt.Printf("%s: skipped\n", rel)
 				case MetadataOnly:
 					fmt.Printf("%s: updated metadata %v\n", rel, ret.MissingAlgorithms)
-				case Upload:
+				case Copied:
 					fmt.Printf("%s: uploaded\n", rel)
 				}
 			}
@@ -138,11 +160,10 @@ func S3Sync() {
 
 	syncer.Close()
 	close(result)
+	wg.Wait()
 
 	if err != nil {
-		fmt.Printf("sync failed: %v", err)
-		slog.Error("sync failed", "err", err)
-		os.Exit(1)
+		logging.FatalError(ctx, "sync failed", err)
 	}
 
 	fmt.Println("sync complete")

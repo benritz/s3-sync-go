@@ -24,14 +24,14 @@ func ParseLocal(src string) (*LocalPath, error) {
 	if !filepath.IsAbs(src) {
 		wd, err := os.Getwd()
 		if err != nil {
-			return nil, fmt.Errorf("failed to get current working directory: %v", err)
+			return nil, err
 		}
 		src = filepath.Join(wd, src)
 	}
 
 	stat, err := os.Stat(src)
 	if err != nil {
-		return nil, fmt.Errorf("source does not exist: %v", err)
+		return nil, err
 	}
 
 	var base string

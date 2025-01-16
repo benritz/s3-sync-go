@@ -62,7 +62,7 @@ func ParseAlgorithm(algorithm string) (Algorithm, error) {
 	case "md5":
 		return MD5, nil
 	default:
-		return -1, fmt.Errorf("unsupported digest algorithm: %v", algorithm)
+		return -1, fmt.Errorf("unsupported hash algorithm: %v", algorithm)
 	}
 }
 
