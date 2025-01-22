@@ -90,22 +90,25 @@ func S3Sync() {
 
 	src, dst := args[0], args[1]
 
-	srcPath, err := paths.ParseLocal(src)
+	srcRoot, err := paths.Parse(src)
 	if err != nil {
 		logging.FatalError(ctx, "failed to parse source", err)
 	}
 
-	dstPath, err := paths.ParseS3Path(dst)
-
+	dstRoot, err := paths.Parse(dst)
 	if err != nil {
 		logging.FatalError(ctx, "failed to parse destination", err)
+	}
+
+	if dstRoot.S3 == nil {
+		logging.FatalError(ctx, "destination must be an S3 path", nil)
 	}
 
 	slog.DebugContext(
 		ctx,
 		"arguments",
-		"src", srcPath,
-		"dst", dstPath,
+		"src", srcRoot,
+		"dst", dstRoot,
 		"algorithms", algorithms,
 		"size only", *sizeOnly,
 		"dry run", *dryRun,
@@ -140,7 +143,7 @@ func S3Sync() {
 					return
 				}
 
-				rel := ret.Path[len(srcPath.Base):]
+				rel := srcRoot.GetRel(ret.SrcPath.Path)
 
 				switch ret.Type {
 				case Error:
@@ -150,13 +153,13 @@ func S3Sync() {
 				case MetadataOnly:
 					fmt.Printf("%s: updated metadata %v\n", rel, ret.MissingAlgorithms)
 				case Copied:
-					fmt.Printf("%s: uploaded\n", rel)
+					fmt.Printf("%s: copied\n", rel)
 				}
 			}
 		}
 	}()
 
-	err = syncer.Sync(ctx, *srcPath, *dstPath, result)
+	err = syncer.Sync(ctx, srcRoot, dstRoot, result)
 
 	syncer.Close()
 	close(result)

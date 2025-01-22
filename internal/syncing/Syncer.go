@@ -7,11 +7,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -59,20 +59,18 @@ const (
 )
 
 type SyncResult struct {
-	Bucket            string
-	Key               string
-	Path              string
+	SrcPath           *paths.Path
+	DstPath           *paths.Path
 	Type              SyncType
 	MissingAlgorithms []hashing.Algorithm
 	Metadata          map[string]string
 	Err               error
 }
 
-func NewSyncResult(bucket, key, path string) *SyncResult {
+func NewSyncResult(dstPath, srcPath *paths.Path) *SyncResult {
 	return &SyncResult{
-		Bucket: bucket,
-		Key:    key,
-		Path:   path,
+		SrcPath: srcPath,
+		DstPath: dstPath,
 	}
 }
 
@@ -94,9 +92,7 @@ func (r *SyncResult) MetadataOnly(missingAlgorithms []hashing.Algorithm, metadat
 }
 
 func (r *SyncResult) Error(err error) *SyncResult {
-	if r.Type == 0 {
-		r.Type = Error
-	}
+	r.Type = Error
 	r.Err = err
 	return r
 }
@@ -104,13 +100,84 @@ func (r *SyncResult) Error(err error) *SyncResult {
 func (s *Syncer) generateHashes(
 	ctx context.Context,
 	algorithms []hashing.Algorithm,
-	path string,
+	path *paths.Path,
 	metadata map[string]string,
+	useSrcMetadata bool,
 ) error {
+	var localPath string
+	if path.S3 != nil {
+		// look for metadata in src object
+		if useSrcMetadata {
+			ret, err := s.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+				Bucket: aws.String(path.Bucket),
+				Key:    aws.String(path.Key),
+			})
+
+			if err != nil {
+				return fmt.Errorf("failed to head object: %v", err)
+			}
+
+			// copy existing metadata including hashes
+			for key, value := range ret.Metadata {
+				metadata[key] = value
+			}
+
+			// remove any found algorithms
+			var a []hashing.Algorithm
+
+			for _, algorithm := range algorithms {
+				if _, exists := metadata[algorithm.String()]; !exists {
+					a = append(a, algorithm)
+				}
+			}
+
+			if len(a) == 0 {
+				return nil
+			}
+
+			algorithms = a
+		}
+
+		ret, err := s.s3Client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket: aws.String(path.Bucket),
+			Key:    aws.String(path.Key),
+		})
+
+		if err != nil {
+			return fmt.Errorf("failed to get object: %v", err)
+		}
+
+		defer ret.Body.Close()
+
+		tmp, err := os.CreateTemp("", "prefix-*.txt")
+		if err != nil {
+			return fmt.Errorf("failed to create temp file: %v", err)
+		}
+		defer os.Remove(tmp.Name())
+
+		written, err := io.Copy(tmp, ret.Body)
+		if err != nil {
+			tmp.Close()
+			return fmt.Errorf("failed to copy object to temp file: %v", err)
+		}
+		if written != *ret.ContentLength {
+			tmp.Close()
+			return fmt.Errorf("failed to copy object to temp file, length mismatch: written=%v, length=%v", written, *ret.ContentLength)
+		}
+
+		if err := tmp.Close(); err != nil {
+			return fmt.Errorf("failed to close temp file: %v", err)
+		}
+
+		localPath = tmp.Name()
+	} else {
+		localPath = path.Path
+	}
+
 	result := make(chan hashing.HashResult, len(algorithms))
 
 	for _, algorithm := range algorithms {
-		s.hasher.Generate(path, algorithm, result)
+		s.hasher.Generate(localPath, algorithm, result)
 	}
 
 	completed := 0
@@ -139,10 +206,8 @@ func (s *Syncer) generateHashes(
 }
 
 type syncJob struct {
-	Bucket    string
-	Key       string
-	Path      string
-	DirEntry  fs.DirEntry `json:"-"`
+	SrcPath   *paths.Path
+	DstPath   *paths.Path
 	SyncCheck SyncCheck
 	Result    chan<- *SyncResult `json:"-"`
 }
@@ -179,18 +244,16 @@ func (s *Syncer) worker(ctx context.Context, id int) {
 				"job", job,
 			)
 
-			ret := s.syncToS3(
+			ret := s.sync(
 				ctx,
-				job.Bucket,
-				job.Key,
-				job.Path,
-				job.DirEntry,
+				job.SrcPath,
+				job.DstPath,
 				job.SyncCheck,
 			)
 
 			if logging.LogLevel.Level() == slog.LevelDebug {
-				src := ret.Path
-				dst := fmt.Sprintf("s3://%s/%s", ret.Bucket, ret.Key)
+				src := ret.SrcPath.Path
+				dst := ret.DstPath.Path
 
 				switch ret.Type {
 				case Error:
@@ -270,10 +333,14 @@ func (s *Syncer) Close() {
 
 func (s *Syncer) Sync(
 	ctx context.Context,
-	srcPath paths.LocalPath,
-	dstPath paths.S3Path,
+	srcRoot *paths.Path,
+	dstRoot *paths.Path,
 	result chan<- *SyncResult,
 ) error {
+	if dstRoot.S3 == nil {
+		return fmt.Errorf("destination path is not an S3 path")
+	}
+
 	var syncCheck SyncCheck
 
 	if s.SizeOnly {
@@ -282,14 +349,47 @@ func (s *Syncer) Sync(
 		syncCheck = ModifiedAndSize
 	}
 
-	if srcPath.Stat.IsDir() {
+	if srcRoot.S3 == nil {
+		return s.syncFromLocal(
+			ctx,
+			srcRoot,
+			dstRoot,
+			syncCheck,
+			result,
+		)
+	}
+
+	s.syncFromS3(
+		ctx,
+		srcRoot,
+		dstRoot,
+		syncCheck,
+		result,
+	)
+
+	return nil
+}
+
+func (s *Syncer) syncFromLocal(
+	ctx context.Context,
+	srcRoot *paths.Path,
+	dstRoot *paths.Path,
+	syncCheck SyncCheck,
+	result chan<- *SyncResult,
+) error {
+	stat, err := os.Stat(srcRoot.Path)
+	if err != nil {
+		return fmt.Errorf("source path not found: %v", err)
+	}
+
+	if stat.IsDir() {
 		// check for any objects under destination
 		// we don't need to perform any sync checks if the destination is empty
 		maxKeys := int32(1)
 
 		ret, err := s.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:  aws.String(dstPath.Bucket),
-			Prefix:  aws.String(dstPath.Prefix + "/"),
+			Bucket:  aws.String(dstRoot.Bucket),
+			Prefix:  aws.String(dstRoot.Key + "/"),
 			MaxKeys: &maxKeys,
 		})
 
@@ -302,26 +402,38 @@ func (s *Syncer) Sync(
 		}
 	}
 
-	err := filepath.WalkDir(srcPath.Path, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(srcRoot.Path, func(path string, d fs.DirEntry, err error) error {
 		if d.IsDir() {
 			// ignore - don't create directory marker in S3
 			return nil
 		}
 
-		rel := strings.TrimPrefix(path, srcPath.Base)
-		key := dstPath.Prefix + "/" + rel
+		srcPath := &paths.Path{Path: path}
+
+		rel := srcRoot.GetRel(path)
+		dstPath := dstRoot.AppendRel(rel)
+
+		syncResultError := func(err error) *SyncResult {
+			ret := NewSyncResult(srcPath, dstPath)
+			return ret.Error(err)
+		}
 
 		if err != nil {
-			ret := NewSyncResult(dstPath.Bucket, key, path)
-			result <- ret.Error(fmt.Errorf("failed to read path: %v", err))
+			result <- syncResultError(fmt.Errorf("failed to read path: %v", err))
 			return nil
 		}
 
+		fileInfo, err := d.Info()
+		if err != nil {
+			result <- syncResultError(fmt.Errorf("failed to get file info: %v", err))
+			return nil
+		}
+
+		srcPath.PathInfo = paths.FromFileInfo(fileInfo)
+
 		s.queue <- syncJob{
-			Bucket:    dstPath.Bucket,
-			Key:       key,
-			Path:      path,
-			DirEntry:  d,
+			SrcPath:   srcPath,
+			DstPath:   dstPath,
 			SyncCheck: syncCheck,
 			Result:    result,
 		}
@@ -332,21 +444,121 @@ func (s *Syncer) Sync(
 	return err
 }
 
+func (s *Syncer) syncFromS3(
+	ctx context.Context,
+	srcRoot *paths.Path,
+	dstRoot *paths.Path,
+	syncCheck SyncCheck,
+	result chan<- *SyncResult,
+) error {
+	var queuePath = func(path *paths.Path) {
+		rel := srcRoot.GetRel(path.Path)
+		dstPath := dstRoot.AppendRel(rel)
+
+		s.queue <- syncJob{
+			SrcPath:   path,
+			DstPath:   dstPath,
+			SyncCheck: syncCheck,
+			Result:    result,
+		}
+	}
+
+	// check if src path is an object or a directory
+	ret, err := s.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(srcRoot.Bucket),
+		Key:    aws.String(srcRoot.Key),
+	})
+
+	var isDir bool
+
+	if err != nil {
+		var notFound *types.NotFound
+		if errors.As(err, &notFound) {
+			isDir = true
+		} else {
+			return fmt.Errorf("failed to head object: %s %v", srcRoot.Path, err)
+		}
+	} else {
+		isDir = *ret.ContentLength == 0
+	}
+
+	if !isDir {
+		srcPath := &paths.Path{
+			Path: srcRoot.Path,
+			S3:   srcRoot.S3,
+			PathInfo: &paths.PathInfo{
+				Size:    *ret.ContentLength,
+				ModTime: *ret.LastModified,
+			},
+		}
+
+		queuePath(srcPath)
+	} else {
+		// check for any objects under destination
+		// we don't need to perform any sync checks if the destination is empty
+		maxKeys := int32(1)
+
+		ret, err := s.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:  aws.String(dstRoot.Bucket),
+			Prefix:  aws.String(dstRoot.Key + "/"),
+			MaxKeys: &maxKeys,
+		})
+
+		if err != nil {
+			return fmt.Errorf("failed to check for destination objects: %v", err)
+		}
+
+		if *ret.KeyCount == 0 {
+			syncCheck = None
+		}
+
+		paginator := s3.NewListObjectsV2Paginator(s.s3Client, &s3.ListObjectsV2Input{
+			Bucket: aws.String(srcRoot.Bucket),
+			Prefix: aws.String(srcRoot.Key + "/"),
+		})
+
+		for paginator.HasMorePages() {
+			page, err := paginator.NextPage(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to check for destination objects: %v", err)
+			}
+
+			for _, obj := range page.Contents {
+				srcPath := &paths.Path{
+					Path: fmt.Sprintf("s3://%s/%s", srcRoot.Bucket, *obj.Key),
+					S3: &paths.S3{
+						Bucket: srcRoot.Bucket,
+						Key:    *obj.Key,
+					},
+					PathInfo: &paths.PathInfo{
+						Size:    *obj.Size,
+						ModTime: *obj.LastModified,
+					},
+				}
+
+				queuePath(srcPath)
+			}
+		}
+	}
+
+	return nil
+}
+
 func (s *Syncer) checkIfSyncNeeded(
 	ctx context.Context,
-	bucket, key, path string,
-	entry fs.DirEntry,
+	srcPath *paths.Path,
+	dstPath *paths.Path,
 	syncCheck SyncCheck,
 ) *SyncResult {
-	ret := NewSyncResult(bucket, key, path)
+	ret := NewSyncResult(srcPath, dstPath)
 
 	if syncCheck == None {
 		return ret.Copied()
 	}
 
 	objectInfo, err := s.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(bucket),
-		Key:    aws.String(key),
+		Bucket: aws.String(dstPath.Bucket),
+		Key:    aws.String(dstPath.Key),
 	})
 
 	if err != nil {
@@ -354,25 +566,30 @@ func (s *Syncer) checkIfSyncNeeded(
 		if errors.As(err, &notFound) {
 			return ret.Copied()
 		}
-		return ret.Error(fmt.Errorf("failed to head object: %s %v", key, err))
+		return ret.Error(fmt.Errorf("failed to head object: %s %v", dstPath.Path, err))
 	}
 
-	fileInfo, err := entry.Info()
-	if err != nil {
-		return ret.Error(fmt.Errorf("failed to get file info: %s %v", path, err))
-	}
+	var match bool
 
-	objectSize := objectInfo.ContentLength
-	sizeMatch := objectSize != nil && fileInfo.Size() == *objectSize
+	if srcPath.IsSame(dstPath) {
+		match = true
+	} else {
+		if srcPath.PathInfo == nil {
+			return ret.Error(fmt.Errorf("failed to get path info: %s", srcPath.Path))
+		}
 
-	match := sizeMatch
+		objectSize := objectInfo.ContentLength
+		sizeMatch := objectSize != nil && srcPath.Size == *objectSize
 
-	if match && syncCheck == ModifiedAndSize {
-		lastModified := objectInfo.LastModified
-		lastModifiedMatch := lastModified != nil &&
-			(fileInfo.ModTime() == *lastModified || fileInfo.ModTime().Before(*lastModified))
+		match = sizeMatch
 
-		match = lastModifiedMatch
+		if match && syncCheck == ModifiedAndSize {
+			lastModified := objectInfo.LastModified
+			lastModifiedMatch := lastModified != nil &&
+				(srcPath.ModTime == *lastModified || srcPath.ModTime.Before(*lastModified))
+
+			match = lastModifiedMatch
+		}
 	}
 
 	if match {
@@ -393,15 +610,15 @@ func (s *Syncer) checkIfSyncNeeded(
 	return ret.Copied()
 }
 
-func (s *Syncer) copyObject(ctx context.Context, path, bucket, key string, metadata map[string]string) error {
+func (s *Syncer) updateMetadata(ctx context.Context, dstPath *paths.Path, metadata map[string]string) error {
 	if logging.LogLevel.Level() == slog.LevelDebug {
-		defer logging.DebugTimeElapsed(fmt.Sprintf("copyObject %s s3://%s/%s %v", path, bucket, key, metadata))()
+		defer logging.DebugTimeElapsed(fmt.Sprintf("updateMetadata %s %v", dstPath.Path, metadata))()
 	}
 
 	_, err := s.s3Client.CopyObject(ctx, &s3.CopyObjectInput{
-		Bucket:            aws.String(bucket),
-		Key:               aws.String(key),
-		CopySource:        aws.String(bucket + "/" + key),
+		Bucket:            aws.String(dstPath.Bucket),
+		Key:               aws.String(dstPath.Key),
+		CopySource:        aws.String(dstPath.Bucket + "/" + dstPath.Key),
 		Metadata:          metadata,
 		MetadataDirective: types.MetadataDirectiveReplace,
 	})
@@ -413,12 +630,42 @@ func (s *Syncer) copyObject(ctx context.Context, path, bucket, key string, metad
 	return err
 }
 
-func (s *Syncer) uploadObject(ctx context.Context, path, bucket, key string, metadata map[string]string) error {
+func (s *Syncer) copyObject(
+	ctx context.Context,
+	srcPath *paths.Path,
+	dstPath *paths.Path,
+	metadata map[string]string,
+) error {
 	if logging.LogLevel.Level() == slog.LevelDebug {
-		defer logging.DebugTimeElapsed(fmt.Sprintf("uploadObject %s s3://%s/%s %v", path, bucket, key, metadata))()
+		defer logging.DebugTimeElapsed(fmt.Sprintf("copyObject %s %s %v", srcPath.Path, dstPath.Path, metadata))()
 	}
 
-	reader, err := os.Open(path)
+	_, err := s.s3Client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:            aws.String(dstPath.Bucket),
+		Key:               aws.String(dstPath.Key),
+		CopySource:        aws.String(srcPath.Bucket + "/" + srcPath.Key),
+		Metadata:          metadata,
+		MetadataDirective: types.MetadataDirectiveReplace,
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to copy object: %v", err)
+	}
+
+	return err
+}
+
+func (s *Syncer) uploadObject(
+	ctx context.Context,
+	srcPath *paths.Path,
+	dstPath *paths.Path,
+	metadata map[string]string,
+) error {
+	if logging.LogLevel.Level() == slog.LevelDebug {
+		defer logging.DebugTimeElapsed(fmt.Sprintf("uploadObject %s %s %v", srcPath.Path, dstPath.Path, metadata))()
+	}
+
+	reader, err := os.Open(srcPath.Path)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %v", err)
 	}
@@ -427,8 +674,8 @@ func (s *Syncer) uploadObject(ctx context.Context, path, bucket, key string, met
 	_, err = s.uploader.Upload(
 		ctx,
 		&s3.PutObjectInput{
-			Bucket:   aws.String(bucket),
-			Key:      aws.String(key),
+			Bucket:   aws.String(dstPath.Bucket),
+			Key:      aws.String(dstPath.Key),
 			Body:     reader,
 			Metadata: metadata,
 		},
@@ -441,18 +688,15 @@ func (s *Syncer) uploadObject(ctx context.Context, path, bucket, key string, met
 	return nil
 }
 
-func (s *Syncer) syncToS3(
+func (s *Syncer) sync(
 	ctx context.Context,
-	bucket, key, path string,
-	entry fs.DirEntry,
+	srcPath, dstPath *paths.Path,
 	checkMode SyncCheck,
 ) *SyncResult {
 	ret := s.checkIfSyncNeeded(
 		ctx,
-		bucket,
-		key,
-		path,
-		entry,
+		srcPath,
+		dstPath,
 		checkMode)
 
 	if ret.Type == Error || ret.Type == Skip {
@@ -461,18 +705,41 @@ func (s *Syncer) syncToS3(
 
 	if ret.Type == MetadataOnly {
 		metadata := ret.Metadata
-		s.generateHashes(ctx, ret.MissingAlgorithms, path, metadata)
+
+		s.generateHashes(
+			ctx,
+			ret.MissingAlgorithms,
+			srcPath,
+			metadata,
+			!srcPath.IsSame(dstPath),
+		)
+
 		if !s.DryRun {
-			err := s.copyObject(ctx, path, bucket, key, metadata)
+			err := s.updateMetadata(ctx, dstPath, metadata)
 			if err != nil {
 				return ret.Error(err)
 			}
 		}
 	} else {
 		metadata := make(map[string]string)
-		s.generateHashes(ctx, s.Algorithms, path, metadata)
+
+		s.generateHashes(
+			ctx,
+			s.Algorithms,
+			srcPath,
+			metadata,
+			true,
+		)
+
 		if !s.DryRun {
-			err := s.uploadObject(ctx, path, bucket, key, metadata)
+			var err error
+
+			if srcPath.S3 != nil {
+				err = s.copyObject(ctx, srcPath, dstPath, metadata)
+			} else {
+				err = s.uploadObject(ctx, srcPath, dstPath, metadata)
+			}
+
 			if err != nil {
 				return ret.Error(err)
 			}
