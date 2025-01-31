@@ -30,10 +30,11 @@ func S3Sync() {
 
 	var hashAlgorithmFlags hashAlgorithmFlag
 
+	flag.Var(&hashAlgorithmFlags, "hashAlgorithm", "the hash algorithm: sha1 (default), sha256, sha512, crc32, crc32c, md5")
 	profile := flag.String("profile", "default", "the AWS profile to use")
 	sizeOnly := flag.Bool("sizeOnly", false, "only check file size")
+	incHidden := flag.Bool("incHidden", false, "include hidden files")
 	dryRun := flag.Bool("dryRun", false, "dry run")
-	flag.Var(&hashAlgorithmFlags, "hashAlgorithm", "the hash algorithm: sha1 (default), sha256, sha512, crc32, crc32c, md5")
 	concurrency := flag.Int("concurrency", 5, "the number of concurrent sync operations")
 	logLevel := flag.String("logLevel", "none", "log level: none, error, warn, info, debug")
 	logFile := flag.String("logFile", "", "log file")
@@ -110,8 +111,13 @@ func S3Sync() {
 		"src", srcRoot,
 		"dst", dstRoot,
 		"algorithms", algorithms,
-		"size only", *sizeOnly,
+		"aws profile", *profile,
 		"dry run", *dryRun,
+		"size only", *sizeOnly,
+		"include hidden", *incHidden,
+		"concurrency", *concurrency,
+		"log level", *logLevel,
+		"log file", *logFile,
 	)
 
 	syncer, err := NewSyncer(
@@ -121,6 +127,7 @@ func S3Sync() {
 		*concurrency,
 		*sizeOnly,
 		*dryRun,
+		*incHidden,
 	)
 
 	if err != nil {

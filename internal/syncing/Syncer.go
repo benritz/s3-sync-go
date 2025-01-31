@@ -216,6 +216,7 @@ type Syncer struct {
 	Algorithms []hashing.Algorithm
 	SizeOnly   bool
 	DryRun     bool
+	IncHidden  bool
 
 	s3Client  *s3.Client
 	uploader  *manager.Uploader
@@ -301,6 +302,7 @@ func NewSyncer(
 	concurrency int,
 	sizeOnly bool,
 	dryRun bool,
+	incHidden bool,
 ) (*Syncer, error) {
 	config, err := getAwsConfig(ctx, profile)
 	if err != nil {
@@ -313,6 +315,7 @@ func NewSyncer(
 		Algorithms: algorithms,
 		SizeOnly:   sizeOnly,
 		DryRun:     dryRun,
+		IncHidden:  incHidden,
 		s3Client:   s3Client,
 		uploader:   manager.NewUploader(s3Client),
 		hasher:     hashing.NewHasher(ctx, concurrency*len(algorithms)),
@@ -403,8 +406,13 @@ func (s *Syncer) syncFromLocal(
 	}
 
 	err = filepath.WalkDir(srcRoot.Path, func(path string, d fs.DirEntry, err error) error {
+		// ignore directories - don't create directory marker in S3
 		if d.IsDir() {
-			// ignore - don't create directory marker in S3
+			return nil
+		}
+
+		// optionally ignories hidden files
+		if !s.IncHidden && paths.IsHidden(path) {
 			return nil
 		}
 

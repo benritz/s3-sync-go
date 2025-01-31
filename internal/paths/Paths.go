@@ -2,6 +2,7 @@ package paths
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,4 +115,12 @@ func parseS3(path string) (*Path, error) {
 			Key:    key,
 		},
 	}, nil
+}
+
+func IsHidden(path string) bool {
+	hidden, err := isHidden(path)
+	if err != nil {
+		slog.Debug("failed to check hidden file", "path", path, "error", err)
+	}
+	return hidden
 }
