@@ -152,7 +152,7 @@ func S3Sync() {
 
 				rel := srcRoot.GetRel(ret.SrcPath.Path)
 
-				switch ret.Type {
+				switch ret.Outcome {
 				case Error:
 					fmt.Printf("%s: failed to sync %v\n", rel, ret.Err)
 				case Skip:

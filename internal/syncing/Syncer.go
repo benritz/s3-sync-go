@@ -49,10 +49,10 @@ func (syncCheck SyncCheck) String() string {
 	}
 }
 
-type SyncType int
+type SyncOutcome int
 
 const (
-	Skip SyncType = iota
+	Skip SyncOutcome = iota
 	Copied
 	MetadataOnly
 	Error
@@ -61,7 +61,7 @@ const (
 type SyncResult struct {
 	SrcPath           *paths.Path
 	DstPath           *paths.Path
-	Type              SyncType
+	Outcome           SyncOutcome
 	MissingAlgorithms []hashing.Algorithm
 	Metadata          map[string]string
 	Err               error
@@ -75,24 +75,24 @@ func NewSyncResult(dstPath, srcPath *paths.Path) *SyncResult {
 }
 
 func (r *SyncResult) Copied() *SyncResult {
-	r.Type = Copied
+	r.Outcome = Copied
 	return r
 }
 
 func (r *SyncResult) Skip() *SyncResult {
-	r.Type = Skip
+	r.Outcome = Skip
 	return r
 }
 
 func (r *SyncResult) MetadataOnly(missingAlgorithms []hashing.Algorithm, metadata map[string]string) *SyncResult {
-	r.Type = MetadataOnly
+	r.Outcome = MetadataOnly
 	r.MissingAlgorithms = missingAlgorithms
 	r.Metadata = metadata
 	return r
 }
 
 func (r *SyncResult) Error(err error) *SyncResult {
-	r.Type = Error
+	r.Outcome = Error
 	r.Err = err
 	return r
 }
@@ -117,12 +117,12 @@ func (s *Syncer) generateHashes(
 				return fmt.Errorf("failed to head object: %v", err)
 			}
 
-			// copy existing metadata including hashes
+			// copy existing metadata which may include hashes
 			for key, value := range ret.Metadata {
 				metadata[key] = value
 			}
 
-			// remove any found algorithms
+			// remove any found hash algorithms
 			var a []hashing.Algorithm
 
 			for _, algorithm := range algorithms {
@@ -256,7 +256,7 @@ func (s *Syncer) worker(ctx context.Context, id int) {
 				src := ret.SrcPath.Path
 				dst := ret.DstPath.Path
 
-				switch ret.Type {
+				switch ret.Outcome {
 				case Error:
 					slog.DebugContext(
 						ctx,
@@ -707,11 +707,11 @@ func (s *Syncer) sync(
 		dstPath,
 		checkMode)
 
-	if ret.Type == Error || ret.Type == Skip {
+	if ret.Outcome == Error || ret.Outcome == Skip {
 		return ret
 	}
 
-	if ret.Type == MetadataOnly {
+	if ret.Outcome == MetadataOnly {
 		metadata := ret.Metadata
 
 		s.generateHashes(
