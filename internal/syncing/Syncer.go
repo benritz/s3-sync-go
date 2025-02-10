@@ -5,6 +5,8 @@ import (
 	"benritz/s3sync/internal/logging"
 	"benritz/s3sync/internal/paths"
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +14,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -212,19 +216,6 @@ type syncJob struct {
 	Result    chan<- *SyncResult `json:"-"`
 }
 
-type Syncer struct {
-	Algorithms []hashing.Algorithm
-	SizeOnly   bool
-	DryRun     bool
-	IncHidden  bool
-
-	s3Client  *s3.Client
-	uploader  *manager.Uploader
-	hasher    *hashing.Hasher
-	queue     chan syncJob
-	waitGroup sync.WaitGroup
-}
-
 func (s *Syncer) worker(ctx context.Context, id int) {
 	s.waitGroup.Add(1)
 	defer s.waitGroup.Done()
@@ -295,34 +286,122 @@ func (s *Syncer) worker(ctx context.Context, id int) {
 	}
 }
 
+// 5GB is the maximum part size for S3 uploads
+var MaxPartSize = int64(5) << 10 << 10 << 10
+
+type Syncer struct {
+	algorithms  []hashing.Algorithm
+	sizeOnly    bool
+	dryRun      bool
+	incHidden   bool
+	maxPartSize int64
+	awsProfile  string
+	concurrency int
+	s3Client    *s3.Client
+	uploader    *manager.Uploader
+	hasher      *hashing.Hasher
+	queue       chan syncJob
+	waitGroup   sync.WaitGroup
+}
+
+type SyncerOption func(*Syncer) error
+
+func WithProfile(profile string) SyncerOption {
+	return func(s *Syncer) error {
+		profile = strings.TrimSpace(profile)
+		if profile == "" {
+			return fmt.Errorf("profile must not be empty")
+		}
+		s.awsProfile = profile
+		return nil
+	}
+}
+
+func WithAlgorithms(algorithms []hashing.Algorithm) SyncerOption {
+	return func(s *Syncer) error {
+		s.algorithms = algorithms
+		return nil
+	}
+}
+
+func WithConcurrency(concurrency int) SyncerOption {
+	return func(s *Syncer) error {
+		if concurrency < 1 {
+			return fmt.Errorf("concurrency must be greater than 0")
+		}
+		if concurrency > runtime.GOMAXPROCS(0) {
+			return fmt.Errorf("concurrency must not exceed %d", runtime.GOMAXPROCS(0))
+		}
+		s.concurrency = concurrency
+		return nil
+	}
+}
+
+func WithMaxPartSize(maxPartSize int64) SyncerOption {
+	return func(s *Syncer) error {
+		if maxPartSize < 1 {
+			return fmt.Errorf("max part size must be greater than 0")
+		}
+		if maxPartSize > MaxPartSize {
+			return fmt.Errorf("max part size must not exceed %d", MaxPartSize)
+		}
+		s.maxPartSize = maxPartSize
+		return nil
+	}
+}
+
+func WithSizeOnly() SyncerOption {
+	return func(s *Syncer) error {
+		s.sizeOnly = true
+		return nil
+	}
+}
+
+func WithDryRun() SyncerOption {
+	return func(s *Syncer) error {
+		s.dryRun = true
+		return nil
+	}
+}
+
+func WithIncHidden() SyncerOption {
+	return func(s *Syncer) error {
+		s.incHidden = true
+		return nil
+	}
+}
+
 func NewSyncer(
 	ctx context.Context,
-	profile string,
-	algorithms []hashing.Algorithm,
-	concurrency int,
-	sizeOnly bool,
-	dryRun bool,
-	incHidden bool,
+	options ...SyncerOption,
 ) (*Syncer, error) {
-	config, err := getAwsConfig(ctx, profile)
+	s := &Syncer{
+		awsProfile:  "default",
+		algorithms:  []hashing.Algorithm{hashing.SHA1},
+		sizeOnly:    false,
+		dryRun:      false,
+		incHidden:   false,
+		maxPartSize: int64(1024 * 1024 * 250),
+		queue:       make(chan syncJob),
+	}
+
+	for _, option := range options {
+		err := option(s)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	config, err := getAwsConfig(ctx, s.awsProfile)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get aws config: %v", err)
 	}
 
-	s3Client := s3.NewFromConfig(config)
+	s.s3Client = s3.NewFromConfig(config)
+	s.uploader = manager.NewUploader(s.s3Client)
+	s.hasher = hashing.NewHasher(ctx, s.concurrency*len(s.algorithms))
 
-	s := &Syncer{
-		Algorithms: algorithms,
-		SizeOnly:   sizeOnly,
-		DryRun:     dryRun,
-		IncHidden:  incHidden,
-		s3Client:   s3Client,
-		uploader:   manager.NewUploader(s3Client),
-		hasher:     hashing.NewHasher(ctx, concurrency*len(algorithms)),
-		queue:      make(chan syncJob),
-	}
-
-	for i := 0; i < concurrency; i++ {
+	for i := 0; i < s.concurrency; i++ {
 		go s.worker(ctx, i)
 	}
 
@@ -346,7 +425,7 @@ func (s *Syncer) Sync(
 
 	var syncCheck SyncCheck
 
-	if s.SizeOnly {
+	if s.sizeOnly {
 		syncCheck = SizeOnly
 	} else {
 		syncCheck = ModifiedAndSize
@@ -412,7 +491,7 @@ func (s *Syncer) syncFromLocal(
 		}
 
 		// optionally ignories hidden files
-		if !s.IncHidden && paths.IsHidden(path) {
+		if !s.incHidden && paths.IsHidden(path) {
 			return nil
 		}
 
@@ -602,7 +681,7 @@ func (s *Syncer) checkIfSyncNeeded(
 
 	if match {
 		missingAlgorithms := make([]hashing.Algorithm, 0)
-		for _, algorithm := range s.Algorithms {
+		for _, algorithm := range s.algorithms {
 			if _, exists := objectInfo.Metadata[algorithm.String()]; !exists {
 				missingAlgorithms = append(missingAlgorithms, algorithm)
 			}
@@ -663,6 +742,23 @@ func (s *Syncer) copyObject(
 	return err
 }
 
+func convertHexToBase64(hexStr string) (string, error) {
+	binary, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return "", err
+	}
+	ret := base64.StdEncoding.EncodeToString(binary)
+	return ret, nil
+}
+
+func withPartSize(partSize *int64) func(*manager.Uploader) {
+	return func(uploader *manager.Uploader) {
+		if partSize != nil {
+			uploader.PartSize = *partSize
+		}
+	}
+}
+
 func (s *Syncer) uploadObject(
 	ctx context.Context,
 	srcPath *paths.Path,
@@ -679,15 +775,46 @@ func (s *Syncer) uploadObject(
 	}
 	defer reader.Close()
 
-	_, err = s.uploader.Upload(
-		ctx,
-		&s3.PutObjectInput{
-			Bucket:   aws.String(dstPath.Bucket),
-			Key:      aws.String(dstPath.Key),
-			Body:     reader,
-			Metadata: metadata,
-		},
-	)
+	input := s3.PutObjectInput{
+		Bucket:   aws.String(dstPath.Bucket),
+		Key:      aws.String(dstPath.Key),
+		Body:     reader,
+		Metadata: metadata,
+	}
+
+	// add checksum to upload
+	// s3 supports CRC32C, CRC32, SHA256, SHA1  (CRC-64/NVME is supported but not in the SDK)
+	// only CRC algorithms support full object checksums
+	var partSize *int64
+
+	if hash, exists := metadata[hashing.CRC32C.String()]; exists {
+		ret, err := convertHexToBase64(hash)
+		if err == nil {
+			input.ChecksumCRC32C = aws.String(ret)
+		}
+	} else if hash, exists := metadata[hashing.CRC32.String()]; exists {
+		ret, err := convertHexToBase64(hash)
+		if err == nil {
+			input.ChecksumCRC32 = aws.String(ret)
+		}
+	} else if srcPath.PathInfo != nil && srcPath.PathInfo.Size <= s.maxPartSize {
+		// multi-part uploads can only SHA checksum if the object size is less or equal to the part size
+		partSize = &s.maxPartSize
+
+		if hash, exists := metadata[hashing.SHA256.String()]; exists {
+			ret, err := convertHexToBase64(hash)
+			if err == nil {
+				input.ChecksumSHA256 = aws.String(ret)
+			}
+		} else if hash, exists := metadata[hashing.SHA1.String()]; exists {
+			ret, err := convertHexToBase64(hash)
+			if err == nil {
+				input.ChecksumSHA1 = aws.String(ret)
+			}
+		}
+	}
+
+	_, err = s.uploader.Upload(ctx, &input, withPartSize(partSize))
 
 	if err != nil {
 		return fmt.Errorf("failed to upload: %v", err)
@@ -722,7 +849,7 @@ func (s *Syncer) sync(
 			!srcPath.IsSame(dstPath),
 		)
 
-		if !s.DryRun {
+		if !s.dryRun {
 			err := s.updateMetadata(ctx, dstPath, metadata)
 			if err != nil {
 				return ret.Error(err)
@@ -733,13 +860,13 @@ func (s *Syncer) sync(
 
 		s.generateHashes(
 			ctx,
-			s.Algorithms,
+			s.algorithms,
 			srcPath,
 			metadata,
 			true,
 		)
 
-		if !s.DryRun {
+		if !s.dryRun {
 			var err error
 
 			if srcPath.S3 != nil {

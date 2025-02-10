@@ -5,12 +5,15 @@ import (
 	"benritz/s3sync/internal/logging"
 	"benritz/s3sync/internal/paths"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
-	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -25,6 +28,74 @@ func (flag *hashAlgorithmFlag) Set(value string) error {
 	return nil
 }
 
+// parse the part size string and return the size in bytes
+// e.g. 5MB -> 5 * 1024 * 1024
+var ErrInvalidSizeFormat = errors.New("invalid size format")
+
+func parsePartSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+
+	var num, suffix string
+	fraction := false
+
+	for i, r := range s {
+		if r == '.' {
+			fraction = true
+		} else if r < '0' || r > '9' {
+			num = s[:i]
+			suffix = strings.TrimSpace(s[i:])
+			break
+		}
+	}
+
+	if num == "" {
+		num = s
+		suffix = "B"
+	} else {
+		suffix = strings.ToUpper(suffix)
+	}
+
+	if fraction {
+		value, err := strconv.ParseFloat(num, 64)
+		if err != nil {
+			return 0, err
+		}
+
+		switch suffix {
+		case "", "B":
+			// nothing to do
+		case "KB", "K":
+			value *= 1024
+		case "MB", "M":
+			value *= 1024 * 1024
+		case "GB", "G":
+			value *= 1024 * 1024 * 1024
+		default:
+			return 0, ErrInvalidSizeFormat
+		}
+
+		return int64(math.Ceil(value)), nil
+	}
+
+	value, err := strconv.ParseInt(num, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	switch suffix {
+	case "", "B":
+		return value, nil
+	case "KB", "K":
+		return value << 10, nil
+	case "MB", "M":
+		return value << 10 << 10, nil
+	case "GB", "G":
+		return value << 10 << 10 << 10, nil
+	default:
+		return 0, ErrInvalidSizeFormat
+	}
+}
+
 func S3Sync() {
 	ctx := context.Background()
 
@@ -36,6 +107,7 @@ func S3Sync() {
 	incHidden := flag.Bool("incHidden", false, "include hidden files")
 	dryRun := flag.Bool("dryRun", false, "dry run")
 	concurrency := flag.Int("concurrency", 5, "the number of concurrent sync operations")
+	maxPartSize := flag.String("maxPartSize", "", "the maximum part size for multipart uploads, used when setting the checksum value for SHA checksum functions")
 	logLevel := flag.String("logLevel", "none", "log level: none, error, warn, info, debug")
 	logFile := flag.String("logFile", "", "log file")
 	helpFlag := flag.Bool("help", false, "print this help message")
@@ -47,24 +119,11 @@ func S3Sync() {
 
 	args := flag.Args()
 
+	// init logging
 	if len(args) != 2 || *helpFlag {
 		fmt.Printf("Usage: %s <flags> <source> <destination>\n", filepath.Base(os.Args[0]))
 		flag.PrintDefaults()
 		os.Exit(1)
-	}
-
-	var algorithms []hashing.Algorithm
-	for _, algorithmName := range hashAlgorithmFlags {
-		algorithm, err := hashing.ParseAlgorithm(algorithmName)
-		if err != nil {
-			logging.FatalError(ctx, "failed to parse algorithm", err)
-		}
-		algorithms = append(algorithms, algorithm)
-	}
-
-	maxConcurrency := runtime.GOMAXPROCS(0)
-	if *concurrency < 1 || *concurrency > maxConcurrency {
-		logging.FatalError(ctx, "invalid concurrency", fmt.Errorf("concurrency must be between 1 and %d, got %d", maxConcurrency, *concurrency))
 	}
 
 	if *logLevel == "none" {
@@ -88,6 +147,43 @@ func S3Sync() {
 
 	logging.Configure()
 	defer logging.Dispose()
+
+	// get options
+	var syncerOptions []SyncerOption
+
+	syncerOptions = append(syncerOptions, WithProfile(*profile))
+
+	var algorithms []hashing.Algorithm
+	for _, algorithmName := range hashAlgorithmFlags {
+		algorithm, err := hashing.ParseAlgorithm(algorithmName)
+		if err != nil {
+			logging.FatalError(ctx, "failed to parse algorithm", err)
+		}
+		algorithms = append(algorithms, algorithm)
+	}
+
+	syncerOptions = append(syncerOptions, WithAlgorithms(algorithms))
+	syncerOptions = append(syncerOptions, WithConcurrency(*concurrency))
+
+	if *maxPartSize != "" {
+		maxPartSizeBytes, err := parsePartSize(*maxPartSize)
+		if err != nil {
+			logging.FatalError(ctx, "invalid part size", err)
+		}
+		syncerOptions = append(syncerOptions, WithMaxPartSize(maxPartSizeBytes))
+	}
+
+	if *sizeOnly {
+		syncerOptions = append(syncerOptions, WithSizeOnly())
+	}
+
+	if *dryRun {
+		syncerOptions = append(syncerOptions, WithDryRun())
+	}
+
+	if *incHidden {
+		syncerOptions = append(syncerOptions, WithIncHidden())
+	}
 
 	src, dst := args[0], args[1]
 
@@ -116,19 +212,12 @@ func S3Sync() {
 		"size only", *sizeOnly,
 		"include hidden", *incHidden,
 		"concurrency", *concurrency,
+		"max part size", *maxPartSize,
 		"log level", *logLevel,
 		"log file", *logFile,
 	)
 
-	syncer, err := NewSyncer(
-		ctx,
-		*profile,
-		algorithms,
-		*concurrency,
-		*sizeOnly,
-		*dryRun,
-		*incHidden,
-	)
+	syncer, err := NewSyncer(ctx, syncerOptions...)
 
 	if err != nil {
 		logging.FatalError(ctx, "failed to create syncer", err)
