@@ -102,6 +102,7 @@ func S3Sync() {
 	profile := flag.String("profile", "default", "the AWS profile to use")
 	sizeOnly := flag.Bool("sizeOnly", false, "only check file size")
 	incHidden := flag.Bool("incHidden", false, "include hidden files")
+	storageClass := flag.String("storageClass", "", "the storage class for uploads: STANDARD, REDUCED_REDUNDANCY, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, GLACIER, DEEP_ARCHIVE")
 	dryRun := flag.Bool("dryRun", false, "dry run")
 	concurrency := flag.Int("concurrency", 5, "the number of concurrent sync operations")
 	maxPartSize := flag.String("maxPartSize", "", "the maximum part size for multipart uploads, used when setting the checksum value for SHA checksum functions")
@@ -181,6 +182,8 @@ func S3Sync() {
 	if *incHidden {
 		syncerOptions = append(syncerOptions, WithIncHidden())
 	}
+
+	syncerOptions = append(syncerOptions, WithStorageClass(*storageClass))
 
 	src, dst := args[0], args[1]
 

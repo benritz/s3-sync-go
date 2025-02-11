@@ -290,18 +290,19 @@ func (s *Syncer) worker(ctx context.Context, id int) {
 var MaxPartSize = int64(5) << 10 << 10 << 10
 
 type Syncer struct {
-	algorithms  []hashing.Algorithm
-	sizeOnly    bool
-	dryRun      bool
-	incHidden   bool
-	maxPartSize int64
-	awsProfile  string
-	concurrency int
-	s3Client    *s3.Client
-	uploader    *manager.Uploader
-	hasher      *hashing.Hasher
-	queue       chan syncJob
-	waitGroup   sync.WaitGroup
+	algorithms   []hashing.Algorithm
+	sizeOnly     bool
+	dryRun       bool
+	incHidden    bool
+	storageClass *types.StorageClass
+	maxPartSize  int64
+	awsProfile   string
+	concurrency  int
+	s3Client     *s3.Client
+	uploader     *manager.Uploader
+	hasher       *hashing.Hasher
+	queue        chan syncJob
+	waitGroup    sync.WaitGroup
 }
 
 type SyncerOption func(*Syncer) error
@@ -367,6 +368,36 @@ func WithDryRun() SyncerOption {
 func WithIncHidden() SyncerOption {
 	return func(s *Syncer) error {
 		s.incHidden = true
+		return nil
+	}
+}
+
+func toStorageClass(storageClass string) (*types.StorageClass, error) {
+	if storageClass == "" {
+		return nil, nil
+	}
+
+	storageClass = strings.ToUpper(storageClass)
+
+	values := types.StorageClass("").Values()
+
+	for _, v := range values {
+		if types.StorageClass(storageClass) == v {
+			return &v, nil
+		}
+	}
+
+	return nil, fmt.Errorf("invalid storage class: %s; %v", storageClass, values)
+}
+
+func WithStorageClass(name string) SyncerOption {
+	return func(s *Syncer) error {
+		storageClass, err := toStorageClass(name)
+		if err != nil {
+			return err
+		}
+
+		s.storageClass = storageClass
 		return nil
 	}
 }
@@ -780,6 +811,10 @@ func (s *Syncer) uploadObject(
 		Key:      aws.String(dstPath.Key),
 		Body:     reader,
 		Metadata: metadata,
+	}
+
+	if s.storageClass != nil {
+		input.StorageClass = *s.storageClass
 	}
 
 	// add checksum to upload
