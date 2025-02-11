@@ -5,7 +5,6 @@ import (
 	"benritz/s3sync/internal/logging"
 	"benritz/s3sync/internal/paths"
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -30,8 +29,6 @@ func (flag *hashAlgorithmFlag) Set(value string) error {
 
 // parse the part size string and return the size in bytes
 // e.g. 5MB -> 5 * 1024 * 1024
-var ErrInvalidSizeFormat = errors.New("invalid size format")
-
 func parsePartSize(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 
@@ -71,7 +68,7 @@ func parsePartSize(s string) (int64, error) {
 		case "GB", "G":
 			value *= 1024 * 1024 * 1024
 		default:
-			return 0, ErrInvalidSizeFormat
+			return 0, fmt.Errorf("invalid size format suffix: %s; use B, K, KB, M, MB, G or GB", suffix)
 		}
 
 		return int64(math.Ceil(value)), nil
@@ -92,7 +89,7 @@ func parsePartSize(s string) (int64, error) {
 	case "GB", "G":
 		return value << 10 << 10 << 10, nil
 	default:
-		return 0, ErrInvalidSizeFormat
+		return 0, fmt.Errorf("invalid size format suffix: %s; use B, K, KB, M, MB, G or GB", suffix)
 	}
 }
 
