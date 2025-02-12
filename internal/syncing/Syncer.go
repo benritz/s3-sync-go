@@ -71,7 +71,7 @@ type SyncResult struct {
 	Err               error
 }
 
-func NewSyncResult(dstPath, srcPath *paths.Path) *SyncResult {
+func NewSyncResult(srcPath, dstPath *paths.Path) *SyncResult {
 	return &SyncResult{
 		SrcPath: srcPath,
 		DstPath: dstPath,
