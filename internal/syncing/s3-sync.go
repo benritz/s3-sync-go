@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 type hashAlgorithmFlag []string
@@ -223,43 +222,18 @@ func S3Sync() {
 		logging.FatalError(ctx, "failed to create syncer", err)
 	}
 
-	result := make(chan *SyncResult)
+	printer := NewSyncPrinter(ctx, srcRoot)
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case ret, ok := <-result:
-				if !ok {
-					return
-				}
-
-				rel := srcRoot.GetRel(ret.SrcPath.Path)
-
-				switch ret.Outcome {
-				case Error:
-					fmt.Printf("%s: failed to sync %v\n", rel, ret.Err)
-				case Skip:
-					fmt.Printf("%s: skipped\n", rel)
-				case MetadataOnly:
-					fmt.Printf("%s: updated metadata %v\n", rel, ret.MissingAlgorithms)
-				case Copied:
-					fmt.Printf("%s: copied\n", rel)
-				}
-			}
-		}
-	}()
-
-	err = syncer.Sync(ctx, srcRoot, dstRoot, result)
+	err = syncer.Sync(
+		ctx,
+		srcRoot,
+		dstRoot,
+		printer.Result,
+		printer.Progress,
+	)
 
 	syncer.Close()
-	close(result)
-	wg.Wait()
+	printer.Close()
 
 	if err != nil {
 		logging.FatalError(ctx, "sync failed", err)

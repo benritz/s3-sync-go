@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -99,6 +100,11 @@ func (r *SyncResult) Error(err error) *SyncResult {
 	r.Outcome = Error
 	r.Err = err
 	return r
+}
+
+type SyncProgress struct {
+	SrcPath  *paths.Path
+	Progress int8
 }
 
 func (s *Syncer) generateHashes(
@@ -213,7 +219,8 @@ type syncJob struct {
 	SrcPath   *paths.Path
 	DstPath   *paths.Path
 	SyncCheck SyncCheck
-	Result    chan<- *SyncResult `json:"-"`
+	Result    chan<- *SyncResult   `json:"-"`
+	Progress  chan<- *SyncProgress `json:"-"`
 }
 
 func (s *Syncer) worker(ctx context.Context, id int) {
@@ -241,6 +248,7 @@ func (s *Syncer) worker(ctx context.Context, id int) {
 				job.SrcPath,
 				job.DstPath,
 				job.SyncCheck,
+				job.Progress,
 			)
 
 			if logging.LogLevel.Level() == slog.LevelDebug {
@@ -281,7 +289,9 @@ func (s *Syncer) worker(ctx context.Context, id int) {
 				}
 			}
 
-			job.Result <- ret
+			if job.Result != nil {
+				job.Result <- ret
+			}
 		}
 	}
 }
@@ -449,6 +459,7 @@ func (s *Syncer) Sync(
 	srcRoot *paths.Path,
 	dstRoot *paths.Path,
 	result chan<- *SyncResult,
+	progress chan<- *SyncProgress,
 ) error {
 	if dstRoot.S3 == nil {
 		return fmt.Errorf("destination path is not an S3 path")
@@ -469,6 +480,7 @@ func (s *Syncer) Sync(
 			dstRoot,
 			syncCheck,
 			result,
+			progress,
 		)
 	}
 
@@ -478,6 +490,7 @@ func (s *Syncer) Sync(
 		dstRoot,
 		syncCheck,
 		result,
+		progress,
 	)
 
 	return nil
@@ -489,6 +502,7 @@ func (s *Syncer) syncFromLocal(
 	dstRoot *paths.Path,
 	syncCheck SyncCheck,
 	result chan<- *SyncResult,
+	progress chan<- *SyncProgress,
 ) error {
 	stat, err := os.Stat(srcRoot.Path)
 	if err != nil {
@@ -554,6 +568,7 @@ func (s *Syncer) syncFromLocal(
 			DstPath:   dstPath,
 			SyncCheck: syncCheck,
 			Result:    result,
+			Progress:  progress,
 		}
 
 		return nil
@@ -568,6 +583,7 @@ func (s *Syncer) syncFromS3(
 	dstRoot *paths.Path,
 	syncCheck SyncCheck,
 	result chan<- *SyncResult,
+	progress chan<- *SyncProgress,
 ) error {
 	var queuePath = func(path *paths.Path) {
 		rel := srcRoot.GetRel(path.Path)
@@ -578,6 +594,7 @@ func (s *Syncer) syncFromS3(
 			DstPath:   dstPath,
 			SyncCheck: syncCheck,
 			Result:    result,
+			Progress:  progress,
 		}
 	}
 
@@ -795,6 +812,7 @@ func (s *Syncer) uploadObject(
 	srcPath *paths.Path,
 	dstPath *paths.Path,
 	metadata map[string]string,
+	progress chan<- *SyncProgress,
 ) error {
 	if logging.LogLevel.Level() == slog.LevelDebug {
 		defer logging.DebugTimeElapsed(fmt.Sprintf("uploadObject %s %s %v", srcPath.Path, dstPath.Path, metadata))()
@@ -806,10 +824,26 @@ func (s *Syncer) uploadObject(
 	}
 	defer reader.Close()
 
+	var progressFn func(size int)
+
+	if progress != nil {
+		totalRead := 0.0
+		progressFn = func(size int) {
+			totalRead += float64(size)
+			percent := totalRead / float64(srcPath.Size) * 100.0
+			progress <- &SyncProgress{
+				SrcPath:  srcPath,
+				Progress: int8(math.Min(percent, 100.0)),
+			}
+		}
+	} else {
+		progressFn = func(size int) {}
+	}
+
 	input := s3.PutObjectInput{
 		Bucket:   aws.String(dstPath.Bucket),
 		Key:      aws.String(dstPath.Key),
-		Body:     reader,
+		Body:     paths.NewProgressReader(reader, progressFn),
 		Metadata: metadata,
 	}
 
@@ -862,12 +896,14 @@ func (s *Syncer) sync(
 	ctx context.Context,
 	srcPath, dstPath *paths.Path,
 	checkMode SyncCheck,
+	progress chan<- *SyncProgress,
 ) *SyncResult {
 	ret := s.checkIfSyncNeeded(
 		ctx,
 		srcPath,
 		dstPath,
-		checkMode)
+		checkMode,
+	)
 
 	if ret.Outcome == Error || ret.Outcome == Skip {
 		return ret
@@ -907,7 +943,7 @@ func (s *Syncer) sync(
 			if srcPath.S3 != nil {
 				err = s.copyObject(ctx, srcPath, dstPath, metadata)
 			} else {
-				err = s.uploadObject(ctx, srcPath, dstPath, metadata)
+				err = s.uploadObject(ctx, srcPath, dstPath, metadata, progress)
 			}
 
 			if err != nil {
