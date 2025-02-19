@@ -475,15 +475,7 @@ func (s *Syncer) Sync(
 		syncCheck = ModifiedAndSize
 	}
 
-	slog.DebugContext(ctx, "sync",
-		"srcRoot", srcRoot,
-		"dstRoot", dstRoot,
-		"syncCheck", syncCheck,
-	)
-
 	if srcRoot.S3 == nil {
-		slog.DebugContext(ctx, "syncFromLocal")
-
 		return s.syncFromLocal(
 			ctx,
 			srcRoot,
@@ -493,8 +485,6 @@ func (s *Syncer) Sync(
 			progress,
 		)
 	}
-
-	slog.DebugContext(ctx, "syncFromS3")
 
 	return s.syncFromS3(
 		ctx,
@@ -514,13 +504,6 @@ func (s *Syncer) syncFromLocal(
 	result chan<- *SyncResult,
 	progress chan<- *SyncProgress,
 ) error {
-	slog.DebugContext(
-		ctx,
-		"syncFromLocal",
-		"srcRoot", srcRoot,
-		"dstRoot", dstRoot,
-	)
-
 	stat, err := os.Stat(srcRoot.Path)
 	if err != nil {
 		return fmt.Errorf("source path not found: %v", err)
@@ -602,13 +585,6 @@ func (s *Syncer) syncFromS3(
 	result chan<- *SyncResult,
 	progress chan<- *SyncProgress,
 ) error {
-	slog.DebugContext(
-		ctx,
-		"syncFromS3",
-		"srcRoot", srcRoot,
-		"dstRoot", dstRoot,
-	)
-
 	var queuePath = func(path *paths.Path) {
 		rel := srcRoot.GetRel(path.Path)
 		dstPath := dstRoot.AppendRel(rel)
@@ -641,12 +617,6 @@ func (s *Syncer) syncFromS3(
 		isDir = *ret.ContentLength == 0
 	}
 
-	slog.DebugContext(
-		ctx,
-		"syncFromS3: isDir",
-		"isDir", isDir,
-	)
-
 	if !isDir {
 		srcPath := &paths.Path{
 			Path: srcRoot.Path,
@@ -677,35 +647,16 @@ func (s *Syncer) syncFromS3(
 			syncCheck = None
 		}
 
-		slog.DebugContext(
-			ctx,
-			"syncFromS3: syncCheck",
-			"syncCheck", syncCheck,
-		)
-
 		paginator := s3.NewListObjectsV2Paginator(s.s3Client, &s3.ListObjectsV2Input{
 			Bucket: aws.String(srcRoot.Bucket),
 			Prefix: aws.String(srcRoot.Key + "/"),
 		})
-
-		if !paginator.HasMorePages() {
-			slog.DebugContext(
-				ctx,
-				"syncFromS3: no src pages",
-			)
-		}
 
 		for paginator.HasMorePages() {
 			page, err := paginator.NextPage(ctx)
 			if err != nil {
 				return fmt.Errorf("failed to check for destination objects: %v", err)
 			}
-
-			slog.DebugContext(
-				ctx,
-				"syncFromS3: src pages",
-				"count", len(page.Contents),
-			)
 
 			for _, obj := range page.Contents {
 				srcPath := &paths.Path{
