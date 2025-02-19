@@ -473,7 +473,15 @@ func (s *Syncer) Sync(
 		syncCheck = ModifiedAndSize
 	}
 
+	slog.DebugContext(ctx, "sync",
+		"srcRoot", srcRoot,
+		"dstRoot", dstRoot,
+		"syncCheck", syncCheck,
+	)
+
 	if srcRoot.S3 == nil {
+		slog.DebugContext(ctx, "syncFromLocal")
+
 		return s.syncFromLocal(
 			ctx,
 			srcRoot,
@@ -483,6 +491,8 @@ func (s *Syncer) Sync(
 			progress,
 		)
 	}
+
+	slog.DebugContext(ctx, "syncFromS3")
 
 	s.syncFromS3(
 		ctx,
