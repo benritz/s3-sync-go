@@ -99,6 +99,10 @@ func FatalError(ctx context.Context, msg string, err error) {
 	if configured {
 		slog.ErrorContext(ctx, msg, "err", err)
 	}
-	fmt.Printf("%s: %v\n", msg, err)
+	if err != nil {
+		fmt.Printf("%s: %v\n", msg, err)
+	} else {
+		fmt.Println(msg)
+	}
 	os.Exit(1)
 }

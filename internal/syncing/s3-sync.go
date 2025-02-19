@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -103,7 +104,7 @@ func S3Sync() {
 	incHidden := flag.Bool("incHidden", false, "include hidden files (default false)")
 	storageClass := flag.String("storageClass", "", "the storage class for uploads: STANDARD, REDUCED_REDUNDANCY, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, GLACIER, DEEP_ARCHIVE (default bucket setting)")
 	dryRun := flag.Bool("dryRun", false, "dry run (default false)")
-	concurrency := flag.Int("concurrency", 5, "the number of concurrent operations")
+	concurrency := flag.Int("concurrency", runtime.GOMAXPROCS(0), "the number of concurrent operations")
 	maxPartSize := flag.String("maxPartSize", "", "the maximum part size for multipart uploads, used when setting the checksum value for SHA checksum functions (default 250MB)")
 	logLevel := flag.String("logLevel", "none", "log level: none, error, warn, info, debug")
 	logFile := flag.String("logFile", "", "log file (default stderr)")
