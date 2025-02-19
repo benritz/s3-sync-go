@@ -494,7 +494,7 @@ func (s *Syncer) Sync(
 
 	slog.DebugContext(ctx, "syncFromS3")
 
-	s.syncFromS3(
+	return s.syncFromS3(
 		ctx,
 		srcRoot,
 		dstRoot,
@@ -502,8 +502,6 @@ func (s *Syncer) Sync(
 		result,
 		progress,
 	)
-
-	return nil
 }
 
 func (s *Syncer) syncFromLocal(
