@@ -128,8 +128,10 @@ func (s *Syncer) generateHashes(
 			}
 
 			// copy existing metadata which may include hashes
-			for key, value := range ret.Metadata {
-				metadata[key] = value
+			if ret.Metadata != nil {
+				for key, value := range ret.Metadata {
+					metadata[key] = value
+				}
 			}
 
 			// remove any found hash algorithms
@@ -958,6 +960,9 @@ func (s *Syncer) sync(
 
 	if ret.Outcome == MetadataOnly {
 		metadata := ret.Metadata
+		if metadata == nil {
+			metadata = make(map[string]string)
+		}
 
 		s.generateHashes(
 			ctx,
