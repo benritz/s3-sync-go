@@ -698,19 +698,7 @@ func (s *Syncer) syncFromS3(
 			}
 
 			for _, obj := range page.Contents {
-				srcPath := &paths.Path{
-					Path: fmt.Sprintf("s3://%s/%s", srcRoot.Bucket, *obj.Key),
-					S3: &paths.S3{
-						Bucket:   srcRoot.Bucket,
-						Key:      *obj.Key,
-						Location: srcRoot.Location,
-					},
-					PathInfo: &paths.PathInfo{
-						Size:    *obj.Size,
-						ModTime: *obj.LastModified,
-					},
-				}
-
+				srcPath := paths.FromS3Object(srcRoot, &obj)
 				queuePath(srcPath)
 			}
 		}
@@ -726,6 +714,10 @@ func (s *Syncer) checkIfSyncNeeded(
 	syncCheck SyncCheck,
 ) *SyncResult {
 	ret := NewSyncResult(srcPath, dstPath)
+
+	if srcPath.IsDir {
+		return ret.Skip()
+	}
 
 	if syncCheck == None {
 		return ret.Copied()

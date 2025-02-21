@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 type S3 struct {
@@ -26,12 +28,30 @@ func (p *S3) AppendRel(rel string) *S3 {
 type PathInfo struct {
 	Size    int64
 	ModTime time.Time
+	IsDir   bool
 }
 
 func FromFileInfo(fi os.FileInfo) *PathInfo {
 	return &PathInfo{
 		Size:    fi.Size(),
 		ModTime: fi.ModTime(),
+		IsDir:   fi.IsDir(),
+	}
+}
+
+func FromS3Object(root *Path, obj *types.Object) *Path {
+	return &Path{
+		Path: fmt.Sprintf("s3://%s/%s", root.Bucket, *obj.Key),
+		S3: &S3{
+			Bucket:   root.Bucket,
+			Key:      *obj.Key,
+			Location: root.Location,
+		},
+		PathInfo: &PathInfo{
+			Size:    *obj.Size,
+			ModTime: *obj.LastModified,
+			IsDir:   *obj.Size == 0 && strings.HasSuffix(*obj.Key, "/"),
+		},
 	}
 }
 
