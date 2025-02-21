@@ -121,7 +121,9 @@ func (s *Syncer) generateHashes(
 			ret, err := s.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
 				Bucket: aws.String(path.Bucket),
 				Key:    aws.String(path.Key),
-			})
+			},
+				withRegion(path),
+			)
 
 			if err != nil {
 				return fmt.Errorf("failed to head object: %v", err)
@@ -153,7 +155,9 @@ func (s *Syncer) generateHashes(
 		ret, err := s.s3Client.GetObject(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(path.Bucket),
 			Key:    aws.String(path.Key),
-		})
+		},
+			withRegion(path),
+		)
 
 		if err != nil {
 			return fmt.Errorf("failed to get object: %v", err)
@@ -456,6 +460,19 @@ func (s *Syncer) Close() {
 	s.waitGroup.Wait()
 }
 
+func (s *Syncer) setBucketLocation(ctx context.Context, path *paths.Path) error {
+	ret, err := s.s3Client.GetBucketLocation(ctx, &s3.GetBucketLocationInput{
+		Bucket: aws.String(path.Bucket),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to get bucket location: %v", err)
+	}
+
+	path.S3.Location = string(ret.LocationConstraint)
+
+	return nil
+}
+
 func (s *Syncer) Sync(
 	ctx context.Context,
 	srcRoot *paths.Path,
@@ -475,6 +492,8 @@ func (s *Syncer) Sync(
 		syncCheck = ModifiedAndSize
 	}
 
+	s.setBucketLocation(ctx, srcRoot)
+
 	if srcRoot.S3 == nil {
 		return s.syncFromLocal(
 			ctx,
@@ -485,6 +504,8 @@ func (s *Syncer) Sync(
 			progress,
 		)
 	}
+
+	s.setBucketLocation(ctx, dstRoot)
 
 	return s.syncFromS3(
 		ctx,
@@ -518,7 +539,9 @@ func (s *Syncer) syncFromLocal(
 			Bucket:  aws.String(dstRoot.Bucket),
 			Prefix:  aws.String(dstRoot.Key + "/"),
 			MaxKeys: &maxKeys,
-		})
+		},
+			withRegion(dstRoot),
+		)
 
 		if err != nil {
 			return fmt.Errorf("failed to check for destination objects: %v", err)
@@ -577,6 +600,18 @@ func (s *Syncer) syncFromLocal(
 	return err
 }
 
+func withRegion(path *paths.Path) func(o *s3.Options) {
+	return func(o *s3.Options) {
+		var region string
+		if path.S3.Location != "" {
+			region = path.S3.Location
+		} else {
+			region = "us-east-1"
+		}
+		o.Region = region
+	}
+}
+
 func (s *Syncer) syncFromS3(
 	ctx context.Context,
 	srcRoot *paths.Path,
@@ -602,7 +637,9 @@ func (s *Syncer) syncFromS3(
 	ret, err := s.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(srcRoot.Bucket),
 		Key:    aws.String(srcRoot.Key),
-	})
+	},
+		withRegion(srcRoot),
+	)
 
 	var isDir bool
 
@@ -637,10 +674,12 @@ func (s *Syncer) syncFromS3(
 			Bucket:  aws.String(dstRoot.Bucket),
 			Prefix:  aws.String(dstRoot.Key + "/"),
 			MaxKeys: &maxKeys,
-		})
+		},
+			withRegion(dstRoot),
+		)
 
 		if err != nil {
-			return fmt.Errorf("failed to check for destination objects: %v", err)
+			return fmt.Errorf("failed to check for destination objects: %s %v", dstRoot.Path, err)
 		}
 
 		if *ret.KeyCount == 0 {
@@ -653,17 +692,18 @@ func (s *Syncer) syncFromS3(
 		})
 
 		for paginator.HasMorePages() {
-			page, err := paginator.NextPage(ctx)
+			page, err := paginator.NextPage(ctx, withRegion(srcRoot))
 			if err != nil {
-				return fmt.Errorf("failed to check for destination objects: %v", err)
+				return fmt.Errorf("failed to list source objects: %v", err)
 			}
 
 			for _, obj := range page.Contents {
 				srcPath := &paths.Path{
 					Path: fmt.Sprintf("s3://%s/%s", srcRoot.Bucket, *obj.Key),
 					S3: &paths.S3{
-						Bucket: srcRoot.Bucket,
-						Key:    *obj.Key,
+						Bucket:   srcRoot.Bucket,
+						Key:      *obj.Key,
+						Location: srcRoot.Location,
 					},
 					PathInfo: &paths.PathInfo{
 						Size:    *obj.Size,
@@ -694,7 +734,9 @@ func (s *Syncer) checkIfSyncNeeded(
 	objectInfo, err := s.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(dstPath.Bucket),
 		Key:    aws.String(dstPath.Key),
-	})
+	},
+		withRegion(dstPath),
+	)
 
 	if err != nil {
 		var notFound *types.NotFound
@@ -756,7 +798,9 @@ func (s *Syncer) updateMetadata(ctx context.Context, dstPath *paths.Path, metada
 		CopySource:        aws.String(dstPath.Bucket + "/" + dstPath.Key),
 		Metadata:          metadata,
 		MetadataDirective: types.MetadataDirectiveReplace,
-	})
+	},
+		withRegion(dstPath),
+	)
 
 	if err != nil {
 		return fmt.Errorf("failed to update metadata: %v", err)
@@ -781,7 +825,9 @@ func (s *Syncer) copyObject(
 		CopySource:        aws.String(srcPath.Bucket + "/" + srcPath.Key),
 		Metadata:          metadata,
 		MetadataDirective: types.MetadataDirectiveReplace,
-	})
+	},
+		withRegion(dstPath),
+	)
 
 	if err != nil {
 		return fmt.Errorf("failed to copy object: %v", err)

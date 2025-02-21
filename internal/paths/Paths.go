@@ -10,14 +10,16 @@ import (
 )
 
 type S3 struct {
-	Bucket string
-	Key    string
+	Bucket   string
+	Key      string
+	Location string
 }
 
 func (p *S3) AppendRel(rel string) *S3 {
 	return &S3{
-		Bucket: p.Bucket,
-		Key:    filepath.Join(p.Key, rel),
+		Bucket:   p.Bucket,
+		Key:      filepath.Join(p.Key, rel),
+		Location: p.Location,
 	}
 }
 
