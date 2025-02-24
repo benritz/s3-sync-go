@@ -98,16 +98,16 @@ func S3Sync() {
 
 	var hashAlgorithmFlags hashAlgorithmFlag
 
-	flag.Var(&hashAlgorithmFlags, "hashAlgorithm", "the hash algorithm: sha1 (default), sha256, sha512, crc32, crc32c, md5")
+	flag.Var(&hashAlgorithmFlags, "hash-algorithm", "the hash algorithm: sha1 (default), sha256, sha512, crc32, crc32c, md5")
 	profile := flag.String("profile", "default", "the AWS profile to use")
-	sizeOnly := flag.Bool("sizeOnly", false, "only check file size (default false)")
-	incHidden := flag.Bool("incHidden", false, "include hidden files (default false)")
-	storageClass := flag.String("storageClass", "", "the storage class for uploads: STANDARD, REDUCED_REDUNDANCY, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, GLACIER, DEEP_ARCHIVE (default bucket setting)")
-	dryRun := flag.Bool("dryRun", false, "dry run (default false)")
+	sizeOnly := flag.Bool("size-only", false, "only check file size (default false)")
+	incHidden := flag.Bool("inc-hidden", false, "include hidden files (default false)")
+	storageClass := flag.String("storage-class", "", "the storage class for uploads: STANDARD, REDUCED_REDUNDANCY, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, GLACIER, DEEP_ARCHIVE (default bucket setting)")
+	dryRun := flag.Bool("dry-run", false, "dry run (default false)")
 	concurrency := flag.Int("concurrency", runtime.GOMAXPROCS(0), "the number of concurrent operations")
-	maxPartSize := flag.String("maxPartSize", "", "the maximum part size for multipart uploads, used when setting the checksum value for SHA checksum functions (default 250MB)")
-	logLevel := flag.String("logLevel", "none", "log level: none, error, warn, info, debug")
-	logFile := flag.String("logFile", "", "log file (default stderr)")
+	maxPartSize := flag.String("max-part-size", "", "the maximum part size for multipart uploads, used when setting the checksum value for SHA checksum functions (default 250MB)")
+	logLevel := flag.String("log-level", "none", "log level: none, error, warn, info, debug")
+	logFile := flag.String("log-file", "", "log file (default stderr)")
 	helpFlag := flag.Bool("help", false, "print this help message")
 	flag.Parse()
 
