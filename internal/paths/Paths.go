@@ -20,7 +20,7 @@ type S3 struct {
 func (p *S3) AppendRel(rel string) *S3 {
 	return &S3{
 		Bucket:   p.Bucket,
-		Key:      filepath.Join(p.Key, rel),
+		Key:      join(p.Key, rel),
 		Location: p.Location,
 	}
 }
@@ -76,15 +76,11 @@ func (p *Path) IsSame(other *Path) bool {
 func (p *Path) GetRel(path string) string {
 	rel := strings.TrimPrefix(path, p.Path)
 
-	if rel == "" {
-		return filepath.Base(path)
+	if rel == "" || rel == "/" {
+		return "/"
 	}
 
-	if rel != path {
-		return rel[1:]
-	}
-
-	return path
+	return rel[1:]
 }
 
 func join(p1, p2 string) string {

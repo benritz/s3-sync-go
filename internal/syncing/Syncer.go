@@ -58,8 +58,9 @@ type SyncOutcome int
 
 const (
 	Skip SyncOutcome = iota
-	Copied
+	Copy
 	MetadataOnly
+	DirMarker
 	Error
 )
 
@@ -79,8 +80,8 @@ func NewSyncResult(srcPath, dstPath *paths.Path) *SyncResult {
 	}
 }
 
-func (r *SyncResult) Copied() *SyncResult {
-	r.Outcome = Copied
+func (r *SyncResult) Copy() *SyncResult {
+	r.Outcome = Copy
 	return r
 }
 
@@ -93,6 +94,11 @@ func (r *SyncResult) MetadataOnly(missingAlgorithms []hashing.Algorithm, metadat
 	r.Outcome = MetadataOnly
 	r.MissingAlgorithms = missingAlgorithms
 	r.Metadata = metadata
+	return r
+}
+
+func (r *SyncResult) DirMarker() *SyncResult {
+	r.Outcome = DirMarker
 	return r
 }
 
@@ -285,10 +291,17 @@ func (s *Syncer) worker(ctx context.Context, id int) {
 						"dst", dst,
 						"missingAlgorithms", ret.MissingAlgorithms,
 					)
-				case Copied:
+				case Copy:
 					slog.DebugContext(
 						ctx,
 						"sync worker: copied",
+						"src", src,
+						"dst", dst,
+					)
+				case DirMarker:
+					slog.DebugContext(
+						ctx,
+						"sync worker: dir marker",
 						"src", src,
 						"dst", dst,
 					)
@@ -306,19 +319,20 @@ func (s *Syncer) worker(ctx context.Context, id int) {
 var MaxPartSize = int64(5) << 10 << 10 << 10
 
 type Syncer struct {
-	algorithms   []hashing.Algorithm
-	sizeOnly     bool
-	dryRun       bool
-	incHidden    bool
-	storageClass *types.StorageClass
-	maxPartSize  int64
-	awsProfile   string
-	concurrency  int
-	s3Client     *s3.Client
-	uploader     *manager.Uploader
-	hasher       *hashing.Hasher
-	queue        chan syncJob
-	waitGroup    sync.WaitGroup
+	algorithms    []hashing.Algorithm
+	sizeOnly      bool
+	dryRun        bool
+	incDirMarkers bool
+	incHidden     bool
+	storageClass  *types.StorageClass
+	maxPartSize   int64
+	awsProfile    string
+	concurrency   int
+	s3Client      *s3.Client
+	uploader      *manager.Uploader
+	hasher        *hashing.Hasher
+	queue         chan syncJob
+	waitGroup     sync.WaitGroup
 }
 
 type SyncerOption func(*Syncer) error
@@ -377,6 +391,13 @@ func WithSizeOnly() SyncerOption {
 func WithDryRun() SyncerOption {
 	return func(s *Syncer) error {
 		s.dryRun = true
+		return nil
+	}
+}
+
+func WithIncDirMarkers() SyncerOption {
+	return func(s *Syncer) error {
+		s.incDirMarkers = true
 		return nil
 	}
 }
@@ -553,8 +574,8 @@ func (s *Syncer) syncFromLocal(
 	}
 
 	err = filepath.WalkDir(srcRoot.Path, func(path string, d fs.DirEntry, err error) error {
-		// ignore directories - don't create directory marker in S3
-		if d.IsDir() {
+		// optionally ignore directories (don't create directory marker in S3)
+		if !s.incDirMarkers && d.IsDir() {
 			return nil
 		}
 
@@ -622,6 +643,7 @@ func (s *Syncer) syncFromS3(
 ) error {
 	var queuePath = func(path *paths.Path) {
 		rel := srcRoot.GetRel(path.Path)
+		dstRoot.AppendRel(rel)
 		dstPath := dstRoot.AppendRel(rel)
 
 		s.queue <- syncJob{
@@ -646,15 +668,17 @@ func (s *Syncer) syncFromS3(
 	if err != nil {
 		var notFound *types.NotFound
 		if errors.As(err, &notFound) {
+			// missing, assume it's a directory
 			isDir = true
 		} else {
 			return fmt.Errorf("failed to head object: %s %v", srcRoot.Path, err)
 		}
 	} else {
-		isDir = *ret.ContentLength == 0
+		isDir = *ret.ContentLength == 0 && strings.HasSuffix(srcRoot.Key, "/")
 	}
 
 	if !isDir {
+		// single object
 		srcPath := &paths.Path{
 			Path: srcRoot.Path,
 			S3:   srcRoot.S3,
@@ -715,12 +739,8 @@ func (s *Syncer) checkIfSyncNeeded(
 ) *SyncResult {
 	ret := NewSyncResult(srcPath, dstPath)
 
-	if srcPath.IsDir {
-		return ret.Skip()
-	}
-
-	if syncCheck == None {
-		return ret.Copied()
+	if !srcPath.IsDir && syncCheck == None {
+		return ret.Copy()
 	}
 
 	objectInfo, err := s.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
@@ -733,9 +753,17 @@ func (s *Syncer) checkIfSyncNeeded(
 	if err != nil {
 		var notFound *types.NotFound
 		if errors.As(err, &notFound) {
-			return ret.Copied()
+			if srcPath.IsDir {
+				return ret.DirMarker()
+			}
+
+			return ret.Copy()
 		}
 		return ret.Error(fmt.Errorf("failed to head object: %s %v", dstPath.Path, err))
+	}
+
+	if srcPath.IsDir {
+		return ret.Skip()
 	}
 
 	var match bool
@@ -776,7 +804,7 @@ func (s *Syncer) checkIfSyncNeeded(
 		return ret.MetadataOnly(missingAlgorithms, objectInfo.Metadata)
 	}
 
-	return ret.Copied()
+	return ret.Copy()
 }
 
 func (s *Syncer) updateMetadata(ctx context.Context, dstPath *paths.Path, metadata map[string]string) error {
@@ -823,6 +851,29 @@ func (s *Syncer) copyObject(
 
 	if err != nil {
 		return fmt.Errorf("failed to copy object: %v", err)
+	}
+
+	return err
+}
+
+func (s *Syncer) createDirMarker(
+	ctx context.Context,
+	path *paths.Path,
+) error {
+	if logging.LogLevel.Level() == slog.LevelDebug {
+		defer logging.DebugTimeElapsed(fmt.Sprintf("dirMarker %s", path.Path))()
+	}
+
+	_, err := s.s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(path.Bucket),
+		Key:    aws.String(path.Key),
+		Body:   strings.NewReader(""),
+	},
+		withRegion(path),
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to create dir marker: %v", err)
 	}
 
 	return err
@@ -947,6 +998,17 @@ func (s *Syncer) sync(
 		return ret
 	}
 
+	if ret.Outcome == DirMarker {
+		if !s.dryRun {
+			err := s.createDirMarker(ctx, dstPath)
+			if err != nil {
+				return ret.Error(err)
+			}
+		}
+
+		return ret
+	}
+
 	if ret.Outcome == MetadataOnly {
 		metadata := ret.Metadata
 		if metadata == nil {
@@ -967,29 +1029,32 @@ func (s *Syncer) sync(
 				return ret.Error(err)
 			}
 		}
-	} else {
-		metadata := make(map[string]string)
 
-		s.generateHashes(
-			ctx,
-			s.algorithms,
-			srcPath,
-			metadata,
-			true,
-		)
+		return ret
+	}
 
-		if !s.dryRun {
-			var err error
+	// copy or upload
+	metadata := make(map[string]string)
 
-			if srcPath.S3 != nil {
-				err = s.copyObject(ctx, srcPath, dstPath, metadata)
-			} else {
-				err = s.uploadObject(ctx, srcPath, dstPath, metadata, progress)
-			}
+	s.generateHashes(
+		ctx,
+		s.algorithms,
+		srcPath,
+		metadata,
+		true,
+	)
 
-			if err != nil {
-				return ret.Error(err)
-			}
+	if !s.dryRun {
+		var err error
+
+		if srcPath.S3 != nil {
+			err = s.copyObject(ctx, srcPath, dstPath, metadata)
+		} else {
+			err = s.uploadObject(ctx, srcPath, dstPath, metadata, progress)
+		}
+
+		if err != nil {
+			return ret.Error(err)
 		}
 	}
 

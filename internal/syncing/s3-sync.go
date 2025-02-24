@@ -101,6 +101,7 @@ func S3Sync() {
 	flag.Var(&hashAlgorithmFlags, "hash-algorithm", "the hash algorithm: sha1 (default), sha256, sha512, crc32, crc32c, md5")
 	profile := flag.String("profile", "default", "the AWS profile to use")
 	sizeOnly := flag.Bool("size-only", false, "only check file size (default false)")
+	incDirMarkers := flag.Bool("inc-dir-markers", false, "include directory markers (default false)")
 	incHidden := flag.Bool("inc-hidden", false, "include hidden files (default false)")
 	storageClass := flag.String("storage-class", "", "the storage class for uploads: STANDARD, REDUCED_REDUNDANCY, STANDARD_IA, ONEZONE_IA, INTELLIGENT_TIERING, GLACIER, DEEP_ARCHIVE (default bucket setting)")
 	dryRun := flag.Bool("dry-run", false, "dry run (default false)")
@@ -177,6 +178,10 @@ func S3Sync() {
 
 	if *dryRun {
 		syncerOptions = append(syncerOptions, WithDryRun())
+	}
+
+	if *incDirMarkers {
+		syncerOptions = append(syncerOptions, WithIncDirMarkers())
 	}
 
 	if *incHidden {
