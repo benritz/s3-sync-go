@@ -3,6 +3,7 @@ package paths
 import (
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,18 @@ func (p *S3) AppendRel(rel string) *S3 {
 		Key:      join(p.Key, rel),
 		Location: p.Location,
 	}
+}
+
+func (p *S3) BucketUrlEncoded() string {
+	return url.QueryEscape(p.Bucket)
+}
+
+func (p *S3) KeyUrlEncoded() string {
+	var a []string
+	for _, s := range strings.Split(p.Key, "/") {
+		a = append(a, url.QueryEscape(s))
+	}
+	return strings.Join(a, "/")
 }
 
 type PathInfo struct {

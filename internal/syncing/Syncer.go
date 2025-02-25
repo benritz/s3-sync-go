@@ -538,6 +538,35 @@ func (s *Syncer) Sync(
 	)
 }
 
+func (s *Syncer) s3DirExists(ctx context.Context, path *paths.Path) (bool, error) {
+	maxKeys := int32(1)
+
+	prefix := path.Key + "/"
+
+	ret, err := s.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(path.Bucket),
+		Prefix:  aws.String(prefix),
+		MaxKeys: &maxKeys,
+	},
+		withRegion(path),
+	)
+
+	if err != nil {
+		return false, fmt.Errorf("failed to list objects: %v", err)
+	}
+
+	if *ret.KeyCount == 0 {
+		return false, nil
+	}
+
+	// check for directory marker
+	if *ret.KeyCount == 1 && *ret.Contents[0].Key == prefix {
+		return false, nil
+	}
+
+	return true, nil
+}
+
 func (s *Syncer) syncFromLocal(
 	ctx context.Context,
 	srcRoot *paths.Path,
@@ -551,24 +580,11 @@ func (s *Syncer) syncFromLocal(
 		return fmt.Errorf("source path not found: %v", err)
 	}
 
+	// we don't need to perform any sync checks if the destination is empty
 	if stat.IsDir() {
-		// check for any objects under destination
-		// we don't need to perform any sync checks if the destination is empty
-		maxKeys := int32(1)
-
-		ret, err := s.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:  aws.String(dstRoot.Bucket),
-			Prefix:  aws.String(dstRoot.Key + "/"),
-			MaxKeys: &maxKeys,
-		},
-			withRegion(dstRoot),
-		)
-
-		if err != nil {
-			return fmt.Errorf("failed to check for destination objects: %v", err)
-		}
-
-		if *ret.KeyCount == 0 {
+		if exists, err := s.s3DirExists(ctx, dstRoot); err != nil {
+			return err
+		} else if !exists {
 			syncCheck = None
 		}
 	}
@@ -641,13 +657,9 @@ func (s *Syncer) syncFromS3(
 	result chan<- *SyncResult,
 	progress chan<- *SyncProgress,
 ) error {
-	var queuePath = func(path *paths.Path) {
-		rel := srcRoot.GetRel(path.Path)
-		dstRoot.AppendRel(rel)
-		dstPath := dstRoot.AppendRel(rel)
-
+	queue := func(srcPath, dstPath *paths.Path) {
 		s.queue <- syncJob{
-			SrcPath:   path,
+			SrcPath:   srcPath,
 			DstPath:   dstPath,
 			SyncCheck: syncCheck,
 			Result:    result,
@@ -688,25 +700,22 @@ func (s *Syncer) syncFromS3(
 			},
 		}
 
-		queuePath(srcPath)
-	} else {
-		// check for any objects under destination
-		// we don't need to perform any sync checks if the destination is empty
-		maxKeys := int32(1)
-
-		ret, err := s.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:  aws.String(dstRoot.Bucket),
-			Prefix:  aws.String(dstRoot.Key + "/"),
-			MaxKeys: &maxKeys,
-		},
-			withRegion(dstRoot),
-		)
-
-		if err != nil {
-			return fmt.Errorf("failed to check for destination objects: %s %v", dstRoot.Path, err)
+		// dst path can be a directory or a file
+		// assume directory if no extension
+		var dstPath *paths.Path
+		dstExt := filepath.Ext(dstRoot.Path)
+		if dstExt == "" {
+			name := filepath.Base(srcPath.Path)
+			dstPath = dstRoot.AppendRel(name)
+		} else {
+			dstPath = dstRoot
 		}
 
-		if *ret.KeyCount == 0 {
+		queue(srcPath, dstPath)
+	} else {
+		if exists, err := s.s3DirExists(ctx, dstRoot); err != nil {
+			return err
+		} else if !exists {
 			syncCheck = None
 		}
 
@@ -722,19 +731,22 @@ func (s *Syncer) syncFromS3(
 			}
 
 			for _, obj := range page.Contents {
-				path := paths.FromS3Object(srcRoot, &obj)
+				srcPath := paths.FromS3Object(srcRoot, &obj)
 
 				// optionally ignore directories (don't create directory marker in S3)
-				if !s.incDirMarkers && path.IsDir {
+				if !s.incDirMarkers && srcPath.IsDir {
 					continue
 				}
 
 				// optionally ignories hidden files
-				if !s.incHidden && paths.IsHidden(path) {
+				if !s.incHidden && paths.IsHidden(srcPath) {
 					continue
 				}
 
-				queuePath(path)
+				rel := srcRoot.GetRel(srcPath.Path)
+				dstPath := dstRoot.AppendRel(rel)
+
+				queue(srcPath, dstPath)
 			}
 		}
 	}
@@ -850,10 +862,12 @@ func (s *Syncer) copyObject(
 		defer logging.DebugTimeElapsed(fmt.Sprintf("copyObject %s %s %v", srcPath.Path, dstPath.Path, metadata))()
 	}
 
+	copySrc := srcPath.BucketUrlEncoded() + "/" + srcPath.KeyUrlEncoded()
+
 	_, err := s.s3Client.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket:            aws.String(dstPath.Bucket),
 		Key:               aws.String(dstPath.Key),
-		CopySource:        aws.String(srcPath.Bucket + "/" + srcPath.Key),
+		CopySource:        aws.String(copySrc),
 		Metadata:          metadata,
 		MetadataDirective: types.MetadataDirectiveReplace,
 	},

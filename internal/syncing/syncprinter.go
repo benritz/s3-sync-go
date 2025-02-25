@@ -112,7 +112,13 @@ func (p *SyncPrinter) start(ctx context.Context, srcRoot *paths.Path) {
 				}
 
 				srcPath := ret.SrcPath.Path
+
 				rel := srcRoot.GetRel(srcPath)
+
+				// special case for single file sync
+				if rel == "/" && !ret.SrcPath.IsDir {
+					rel = srcPath
+				}
 
 				var line string
 
