@@ -579,12 +579,12 @@ func (s *Syncer) syncFromLocal(
 			return nil
 		}
 
+		srcPath := &paths.Path{Path: path}
+
 		// optionally ignories hidden files
-		if !s.incHidden && paths.IsHidden(path) {
+		if !s.incHidden && paths.IsHidden(srcPath) {
 			return nil
 		}
-
-		srcPath := &paths.Path{Path: path}
 
 		rel := srcRoot.GetRel(path)
 		dstPath := dstRoot.AppendRel(rel)
@@ -722,8 +722,19 @@ func (s *Syncer) syncFromS3(
 			}
 
 			for _, obj := range page.Contents {
-				srcPath := paths.FromS3Object(srcRoot, &obj)
-				queuePath(srcPath)
+				path := paths.FromS3Object(srcRoot, &obj)
+
+				// optionally ignore directories (don't create directory marker in S3)
+				if !s.incDirMarkers && path.IsDir {
+					continue
+				}
+
+				// optionally ignories hidden files
+				if !s.incHidden && paths.IsHidden(path) {
+					continue
+				}
+
+				queuePath(path)
 			}
 		}
 	}

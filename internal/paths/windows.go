@@ -6,7 +6,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func isHidden(path string) (bool, error) {
+func isHiddenLocal(path string) (bool, error) {
 	pointer, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return false, err

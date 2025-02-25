@@ -135,8 +135,17 @@ func parseS3(path string) (*Path, error) {
 	}, nil
 }
 
-func IsHidden(path string) bool {
-	hidden, err := isHidden(path)
+func isHiddenFileName(path string) bool {
+	name := filepath.Base(path)
+	return strings.HasPrefix(name, ".")
+}
+
+func IsHidden(path *Path) bool {
+	if path.S3 != nil {
+		return isHiddenFileName(path.Path)
+	}
+
+	hidden, err := isHiddenLocal(path.Path)
 	if err != nil {
 		slog.Debug("failed to check hidden file", "path", path, "error", err)
 	}
