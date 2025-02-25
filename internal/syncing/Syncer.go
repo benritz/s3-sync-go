@@ -171,7 +171,7 @@ func (s *Syncer) generateHashes(
 
 		defer ret.Body.Close()
 
-		tmp, err := os.CreateTemp("", "prefix-*.txt")
+		tmp, err := os.CreateTemp("", "s3sync-*.tmp")
 		if err != nil {
 			return fmt.Errorf("failed to create temp file: %v", err)
 		}
