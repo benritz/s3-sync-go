@@ -539,8 +539,7 @@ func (s *Syncer) Sync(
 }
 
 func (s *Syncer) s3DirExists(ctx context.Context, path *paths.Path) (bool, error) {
-	maxKeys := int32(1)
-
+	maxKeys := int32(2)
 	prefix := path.Key + "/"
 
 	ret, err := s.s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
@@ -560,7 +559,9 @@ func (s *Syncer) s3DirExists(ctx context.Context, path *paths.Path) (bool, error
 	}
 
 	// check for directory marker
-	if *ret.KeyCount == 1 && *ret.Contents[0].Key == prefix {
+	if *ret.KeyCount == 1 &&
+		!*ret.IsTruncated &&
+		*ret.Contents[0].Key == prefix {
 		return false, nil
 	}
 
