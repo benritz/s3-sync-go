@@ -127,8 +127,10 @@ func (p *SyncPrinter) start(ctx context.Context, srcRoot *paths.Path) {
 					line = fmt.Sprintf("failed: %s %v\n", rel, ret.Err)
 				case Skip:
 					line = fmt.Sprintf("skipped: %s\n", rel)
-				case MetadataOnly:
+				case UpdateMetadata:
 					line = fmt.Sprintf("updated metadata: %s %v\n", rel, ret.MissingAlgorithms)
+				case UpdateStorageClass:
+					line = fmt.Sprintf("updated storage class: %s\n", rel)
 				case Copy:
 					line = fmt.Sprintf("copied: %s\n", rel)
 				case DirMarker:

@@ -13,9 +13,11 @@ import (
 )
 
 type S3 struct {
-	Bucket   string
-	Key      string
-	Location string
+	Bucket       string
+	Key          string
+	Location     string
+	StorageClass types.StorageClass
+	Metadata     map[string]string
 }
 
 func (p *S3) AppendRel(rel string) *S3 {
@@ -56,9 +58,10 @@ func FromS3Object(root *Path, obj *types.Object) *Path {
 	return &Path{
 		Path: fmt.Sprintf("s3://%s/%s", root.Bucket, *obj.Key),
 		S3: &S3{
-			Bucket:   root.Bucket,
-			Key:      *obj.Key,
-			Location: root.Location,
+			Bucket:       root.Bucket,
+			Key:          *obj.Key,
+			Location:     root.Location,
+			StorageClass: types.StorageClass(obj.StorageClass),
 		},
 		PathInfo: &PathInfo{
 			Size:    *obj.Size,
