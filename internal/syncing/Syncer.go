@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 
@@ -66,11 +67,11 @@ const (
 )
 
 type SyncResult struct {
-	SrcPath           *paths.Path
-	DstPath           *paths.Path
-	Outcome           SyncOutcome
-	MissingAlgorithms []hashing.Algorithm
-	Err               error
+	SrcPath    *paths.Path
+	DstPath    *paths.Path
+	Outcome    SyncOutcome
+	Algorithms []hashing.Algorithm
+	Err        error
 }
 
 func NewSyncResult(srcPath, dstPath *paths.Path) *SyncResult {
@@ -80,8 +81,9 @@ func NewSyncResult(srcPath, dstPath *paths.Path) *SyncResult {
 	}
 }
 
-func (r *SyncResult) Copy() *SyncResult {
+func (r *SyncResult) Copy(algorithms []hashing.Algorithm) *SyncResult {
 	r.Outcome = Copy
+	r.Algorithms = algorithms
 	return r
 }
 
@@ -90,9 +92,9 @@ func (r *SyncResult) Skip() *SyncResult {
 	return r
 }
 
-func (r *SyncResult) UpdateMetadata(missingAlgorithms []hashing.Algorithm) *SyncResult {
+func (r *SyncResult) UpdateMetadata(algorithms []hashing.Algorithm) *SyncResult {
 	r.Outcome = UpdateMetadata
-	r.MissingAlgorithms = missingAlgorithms
+	r.Algorithms = algorithms
 	return r
 }
 
@@ -172,22 +174,26 @@ func (s *Syncer) generateHashes(
 		if err != nil {
 			return fmt.Errorf("failed to create temp file: %v", err)
 		}
-		defer os.Remove(tmp.Name())
+
+		cleanup := func(err error) error {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			return fmt.Errorf("failed to copy object to temp file: %v", err)
+		}
 
 		written, err := io.Copy(tmp, ret.Body)
 		if err != nil {
-			tmp.Close()
-			return fmt.Errorf("failed to copy object to temp file: %v", err)
+			return cleanup(err)
 		}
+
 		if written != *ret.ContentLength {
-			tmp.Close()
-			return fmt.Errorf("failed to copy object to temp file, length mismatch: written=%v, length=%v", written, *ret.ContentLength)
+			err := fmt.Errorf("length mismatch: written=%v, length=%v", written, *ret.ContentLength)
+			return cleanup(err)
 		}
 
-		if err := tmp.Close(); err != nil {
-			return fmt.Errorf("failed to close temp file: %v", err)
-		}
+		tmp.Close()
 
+		path.LocalCopy = tmp.Name()
 		localPath = tmp.Name()
 	} else {
 		localPath = path.Path
@@ -286,7 +292,7 @@ func (s *Syncer) worker(ctx context.Context, id int) {
 						"sync worker: updated metadata",
 						"src", src,
 						"dst", dst,
-						"missingAlgorithms", ret.MissingAlgorithms,
+						"missingAlgorithms", ret.Algorithms,
 					)
 				case Copy:
 					slog.DebugContext(
@@ -775,23 +781,25 @@ func (s *Syncer) checkIfSyncNeeded(
 	srcPath *paths.Path,
 	dstPath *paths.Path,
 	syncCheck SyncCheck,
+	algorithms []hashing.Algorithm,
 ) *SyncResult {
 	ret := NewSyncResult(srcPath, dstPath)
 
 	if !srcPath.IsDir && syncCheck == None {
-		return ret.Copy()
+		return ret.Copy(algorithms)
 	}
 
 	if err := s.headS3Path(ctx, dstPath); err != nil {
 		return ret.Error(err)
 	}
 
+	// dst missing
 	if dstPath.PathInfo == nil {
 		if srcPath.IsDir {
 			return ret.DirMarker()
 		}
 
-		return ret.Copy()
+		return ret.Copy(algorithms)
 	}
 
 	if srcPath.IsDir {
@@ -817,11 +825,11 @@ func (s *Syncer) checkIfSyncNeeded(
 	}
 
 	if !match {
-		return ret.Copy()
+		return ret.Copy(algorithms)
 	}
 
 	missingAlgorithms := make([]hashing.Algorithm, 0)
-	for _, algorithm := range s.algorithms {
+	for _, algorithm := range algorithms {
 		if _, exists := dstPath.Metadata[algorithm.String()]; !exists {
 			missingAlgorithms = append(missingAlgorithms, algorithm)
 		}
@@ -880,10 +888,9 @@ func (s *Syncer) copyObject(
 	ctx context.Context,
 	srcPath *paths.Path,
 	dstPath *paths.Path,
-	metadata map[string]string,
 ) error {
 	if logging.LogLevel.Level() == slog.LevelDebug {
-		defer logging.DebugTimeElapsed(fmt.Sprintf("copyObject %s %s %v", srcPath.Path, dstPath.Path, metadata))()
+		defer logging.DebugTimeElapsed(fmt.Sprintf("copyObject %s %s %v", srcPath.Path, dstPath.Path, dstPath.Metadata))()
 	}
 
 	copySrc := srcPath.BucketUrlEncoded() + "/" + srcPath.KeyUrlEncoded()
@@ -892,7 +899,7 @@ func (s *Syncer) copyObject(
 		Bucket:            aws.String(dstPath.Bucket),
 		Key:               aws.String(dstPath.Key),
 		CopySource:        aws.String(copySrc),
-		Metadata:          metadata,
+		Metadata:          dstPath.Metadata,
 		MetadataDirective: types.MetadataDirectiveReplace,
 		StorageClass:      srcPath.StorageClass,
 	}
@@ -950,21 +957,45 @@ func withPartSize(partSize *int64) func(*manager.Uploader) {
 	}
 }
 
+func (s *Syncer) reader(ctx context.Context, path *paths.Path) (io.ReadCloser, error) {
+	if path.S3 == nil {
+		return os.Open(path.Path)
+	}
+
+	if path.LocalCopy != "" {
+		return os.Open(path.LocalCopy)
+	}
+
+	ret, err := s.s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(path.Bucket),
+		Key:    aws.String(path.Key),
+	},
+		withRegion(path),
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return ret.Body, nil
+}
+
 func (s *Syncer) uploadObject(
 	ctx context.Context,
 	srcPath *paths.Path,
 	dstPath *paths.Path,
-	metadata map[string]string,
 	progress chan<- *SyncProgress,
 ) error {
 	if logging.LogLevel.Level() == slog.LevelDebug {
-		defer logging.DebugTimeElapsed(fmt.Sprintf("uploadObject %s %s %v", srcPath.Path, dstPath.Path, metadata))()
+		defer logging.DebugTimeElapsed(fmt.Sprintf("uploadObject %s %s %v", srcPath.Path, dstPath.Path, dstPath.Metadata))()
 	}
 
-	reader, err := os.Open(srcPath.Path)
+	reader, err := s.reader(ctx, srcPath)
+
 	if err != nil {
-		return fmt.Errorf("failed to open file: %v", err)
+		return fmt.Errorf("failed to get reader: %s %v", srcPath.Path, err)
 	}
+
 	defer reader.Close()
 
 	var progressFn func(size int)
@@ -987,7 +1018,7 @@ func (s *Syncer) uploadObject(
 		Bucket:   aws.String(dstPath.Bucket),
 		Key:      aws.String(dstPath.Key),
 		Body:     paths.NewProgressReader(reader, progressFn),
-		Metadata: metadata,
+		Metadata: dstPath.Metadata,
 	}
 
 	if s.storageClass != nil {
@@ -999,26 +1030,26 @@ func (s *Syncer) uploadObject(
 	// only CRC algorithms support full object checksums
 	var partSize *int64
 
-	if hash, exists := metadata[hashing.CRC32C.String()]; exists {
+	if hash, exists := dstPath.Metadata[hashing.CRC32C.String()]; exists {
 		ret, err := convertHexToBase64(hash)
 		if err == nil {
 			input.ChecksumCRC32C = aws.String(ret)
 		}
-	} else if hash, exists := metadata[hashing.CRC32.String()]; exists {
+	} else if hash, exists := dstPath.Metadata[hashing.CRC32.String()]; exists {
 		ret, err := convertHexToBase64(hash)
 		if err == nil {
 			input.ChecksumCRC32 = aws.String(ret)
 		}
-	} else if srcPath.PathInfo != nil && srcPath.PathInfo.Size <= s.maxPartSize {
+	} else if srcPath.PathInfo.Size <= s.maxPartSize {
 		// multi-part uploads can only SHA checksum if the object size is less or equal to the part size
 		partSize = &s.maxPartSize
 
-		if hash, exists := metadata[hashing.SHA256.String()]; exists {
+		if hash, exists := dstPath.Metadata[hashing.SHA256.String()]; exists {
 			ret, err := convertHexToBase64(hash)
 			if err == nil {
 				input.ChecksumSHA256 = aws.String(ret)
 			}
-		} else if hash, exists := metadata[hashing.SHA1.String()]; exists {
+		} else if hash, exists := dstPath.Metadata[hashing.SHA1.String()]; exists {
 			ret, err := convertHexToBase64(hash)
 			if err == nil {
 				input.ChecksumSHA1 = aws.String(ret)
@@ -1041,11 +1072,25 @@ func (s *Syncer) sync(
 	checkMode SyncCheck,
 	progress chan<- *SyncProgress,
 ) *SyncResult {
+	// source files greater than the maximum part size (limited to 5GB) must be uploaded in multiple parts
+	// ensure CRC32/CRC32C are available for checksum support
+	var algorithms []hashing.Algorithm
+
+	if srcPath.Size > s.maxPartSize &&
+		!(slices.Contains(s.algorithms, hashing.CRC32C) || slices.Contains(s.algorithms, hashing.CRC32)) {
+		algorithms = make([]hashing.Algorithm, len(s.algorithms))
+		copy(algorithms, s.algorithms)
+		algorithms = append(algorithms, hashing.CRC32C)
+	} else {
+		algorithms = s.algorithms
+	}
+
 	ret := s.checkIfSyncNeeded(
 		ctx,
 		srcPath,
 		dstPath,
 		checkMode,
+		algorithms,
 	)
 
 	if ret.Outcome == Error || ret.Outcome == Skip {
@@ -1063,55 +1108,42 @@ func (s *Syncer) sync(
 		return ret
 	}
 
-	if ret.Outcome == UpdateMetadata || ret.Outcome == UpdateStorageClass {
-		if ret.Outcome == UpdateMetadata {
-			metadata := dstPath.Metadata
-			if metadata == nil {
-				metadata = make(map[string]string)
-			}
-
-			s.generateHashes(
-				ctx,
-				ret.MissingAlgorithms,
-				srcPath,
-				metadata,
-				!srcPath.IsSame(dstPath),
-			)
-		}
-
-		if !s.dryRun {
-			err := s.updateObject(ctx, dstPath, ret.Outcome)
-			if err != nil {
-				return ret.Error(err)
-			}
-		}
-
-		return ret
+	if dstPath.Metadata == nil {
+		dstPath.Metadata = make(map[string]string)
 	}
 
-	// copy or upload
-	metadata := make(map[string]string)
+	if len(ret.Algorithms) > 0 {
+		err := s.generateHashes(
+			ctx,
+			ret.Algorithms,
+			srcPath,
+			dstPath.Metadata,
+			!srcPath.IsSame(dstPath),
+		)
 
-	s.generateHashes(
-		ctx,
-		s.algorithms,
-		srcPath,
-		metadata,
-		true,
-	)
-
-	if !s.dryRun {
-		var err error
-
-		if srcPath.S3 != nil {
-			err = s.copyObject(ctx, srcPath, dstPath, metadata)
-		} else {
-			err = s.uploadObject(ctx, srcPath, dstPath, metadata, progress)
-		}
+		defer srcPath.RemoveLocalCopy()
 
 		if err != nil {
 			return ret.Error(err)
 		}
+	}
+
+	if s.dryRun {
+		return ret
+	}
+
+	var err error
+
+	if (ret.Outcome == UpdateMetadata || ret.Outcome == UpdateStorageClass) && srcPath.Size <= MaxPartSize {
+		err = s.updateObject(ctx, dstPath, ret.Outcome)
+	} else if srcPath.S3 != nil && srcPath.Size <= MaxPartSize {
+		err = s.copyObject(ctx, srcPath, dstPath)
+	} else {
+		err = s.uploadObject(ctx, srcPath, dstPath, progress)
+	}
+
+	if err != nil {
+		return ret.Error(err)
 	}
 
 	return ret

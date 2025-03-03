@@ -18,6 +18,7 @@ type S3 struct {
 	Location     string
 	StorageClass types.StorageClass
 	Metadata     map[string]string
+	LocalCopy    string
 }
 
 func (p *S3) AppendRel(rel string) *S3 {
@@ -38,6 +39,13 @@ func (p *S3) KeyUrlEncoded() string {
 		a = append(a, url.QueryEscape(s))
 	}
 	return strings.Join(a, "/")
+}
+
+func (p *S3) RemoveLocalCopy() {
+	if p.LocalCopy != "" {
+		os.Remove(p.LocalCopy)
+		p.LocalCopy = ""
+	}
 }
 
 type PathInfo struct {
@@ -111,6 +119,12 @@ func (p *Path) AppendRel(rel string) *Path {
 	}
 
 	return path
+}
+
+func (p *Path) RemoveLocalCopy() {
+	if p.S3 != nil {
+		p.S3.RemoveLocalCopy()
+	}
 }
 
 func parseLocal(path string) (*Path, error) {
