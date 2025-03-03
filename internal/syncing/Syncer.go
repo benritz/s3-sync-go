@@ -1021,6 +1021,9 @@ func (s *Syncer) uploadObject(
 		Metadata: dstPath.Metadata,
 	}
 
+	if srcPath.S3 != nil {
+		input.StorageClass = srcPath.StorageClass
+	}
 	if s.storageClass != nil {
 		input.StorageClass = *s.storageClass
 	}
