@@ -16,7 +16,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
 
@@ -1028,41 +1027,35 @@ func (s *Syncer) uploadObject(
 		input.StorageClass = *s.storageClass
 	}
 
-	// add checksum to upload
-	// s3 supports CRC32C, CRC32, SHA256, SHA1  (CRC-64/NVME is supported but not in the SDK)
+	// add checksum if full object checksum is possible (object size <= part size)
+	// s3 supports CRC32C, CRC32, CRC-64/NVME, SHA256, SHA1
 	// only CRC algorithms support full object checksums
+	// manager.Uploader does not support the ChecksumType "full object" param yet - https://aws.amazon.com/blogs/aws/introducing-default-data-integrity-protections-for-new-objects-in-amazon-s3/
 	var partSize *int64
 
-	if hash, exists := dstPath.Metadata[hashing.CRC32C.String()]; exists {
-		ret, err := convertHexToBase64(hash)
-		if err == nil {
-			input.ChecksumCRC32C = aws.String(ret)
-		}
-	} else if hash, exists := dstPath.Metadata[hashing.CRC32.String()]; exists {
-		ret, err := convertHexToBase64(hash)
-		if err == nil {
-			input.ChecksumCRC32 = aws.String(ret)
-		}
-	} else if srcPath.PathInfo.Size <= s.maxPartSize {
-		// multi-part uploads can only SHA checksum if the object size is less or equal to the part size
+	if srcPath.PathInfo.Size <= s.maxPartSize {
 		partSize = &s.maxPartSize
 
-		if hash, exists := dstPath.Metadata[hashing.SHA256.String()]; exists {
-			ret, err := convertHexToBase64(hash)
-			if err == nil {
+		if hash, exists := dstPath.Metadata[hashing.CRC32C.String()]; exists {
+			if ret, _ := convertHexToBase64(hash); ret != "" {
+				input.ChecksumCRC32C = aws.String(ret)
+			}
+		} else if hash, exists := dstPath.Metadata[hashing.CRC32.String()]; exists {
+			if ret, _ := convertHexToBase64(hash); ret != "" {
+				input.ChecksumCRC32 = aws.String(ret)
+			}
+		} else if hash, exists := dstPath.Metadata[hashing.SHA256.String()]; exists {
+			if ret, _ := convertHexToBase64(hash); ret != "" {
 				input.ChecksumSHA256 = aws.String(ret)
 			}
 		} else if hash, exists := dstPath.Metadata[hashing.SHA1.String()]; exists {
-			ret, err := convertHexToBase64(hash)
-			if err == nil {
+			if ret, _ := convertHexToBase64(hash); ret != "" {
 				input.ChecksumSHA1 = aws.String(ret)
 			}
 		}
 	}
 
-	_, err = s.uploader.Upload(ctx, &input, withPartSize(partSize))
-
-	if err != nil {
+	if _, err = s.uploader.Upload(ctx, &input, withPartSize(partSize)); err != nil {
 		return fmt.Errorf("failed to upload: %v", err)
 	}
 
@@ -1075,18 +1068,22 @@ func (s *Syncer) sync(
 	checkMode SyncCheck,
 	progress chan<- *SyncProgress,
 ) *SyncResult {
+	// manager.Uploader does not support the ChecksumType "full object" param yet, uncomment the following block when supported
 	// source files greater than the maximum part size (limited to 5GB) must be uploaded in multiple parts
-	// ensure CRC32/CRC32C are available for checksum support
-	var algorithms []hashing.Algorithm
+	// only CRC checksums support full object checksums
+	// ensure a CRC algorithm is used
+	// var algorithms []hashing.Algorithm
 
-	if srcPath.Size > s.maxPartSize &&
-		!(slices.Contains(s.algorithms, hashing.CRC32C) || slices.Contains(s.algorithms, hashing.CRC32)) {
-		algorithms = make([]hashing.Algorithm, len(s.algorithms))
-		copy(algorithms, s.algorithms)
-		algorithms = append(algorithms, hashing.CRC32C)
-	} else {
-		algorithms = s.algorithms
-	}
+	// if srcPath.Size > s.maxPartSize &&
+	// 	!(slices.Contains(s.algorithms, hashing.CRC32C) || slices.Contains(s.algorithms, hashing.CRC32)) {
+	// 	algorithms = make([]hashing.Algorithm, len(s.algorithms))
+	// 	copy(algorithms, s.algorithms)
+	// 	algorithms = append(algorithms, hashing.CRC32C)
+	// } else {
+	// 	algorithms = s.algorithms
+	// }
+
+	algorithms := s.algorithms
 
 	ret := s.checkIfSyncNeeded(
 		ctx,
